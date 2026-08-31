@@ -499,46 +499,35 @@ func (r *REPL) report(a neutral.Action, delivered bool) {
 }
 
 func (r *REPL) help() {
-	r.printf(`
-You stand in for the model: each request asks "what next?". Answer two ways:
+	r.print("\n" + menuHead("ACT", "loop continues") + "\n")
+	r.print(menuLine("call", "<tool> <json|text>", "run a tool; bare text fills its main field") + "\n")
+	r.print(menuLine("shell", "[tool]", "type straight to a shell/exec tool") + "\n")
 
-ACT - run a tool. The harness runs it for real and returns the result as the next
-      request, so you can chain calls (this maps blast radius).
-  call <Tool> <input>  author a tool call; <input> is JSON, or bare text that
-                       fills the tool's main field, e.g.  call Bash whoami
-  shell [Tool]         command mode: type straight to the shell/exec tool
-                       (auto-detected, or name one). ':exit' leaves.
+	r.print("\n" + menuHead("REPLY", "ends the turn") + "\n")
+	r.print(menuLine("reply", "<msg>", "aliases: say, text, end") + "\n")
 
-REPLY - answer in words. Ends the turn: only a tool call continues the loop.
-  reply <message>      reply in words and end the turn (aliases: say, text, end)
+	r.print("\n" + menuHead("INSPECT", "no effect on the harness") + "\n")
+	r.print(menuLine("tools", "", "offered tool names (changes flagged)") + "\n")
+	r.print(menuLine("help", "[tool]", "this menu, or one tool's description") + "\n")
+	r.print(menuLine("schema", "<tool>", "a tool's full input schema") + "\n")
+	r.print(menuLine("template", "<tool>", "JSON skeleton for a tool's input") + "\n")
+	r.print(menuLine("sys", "", "system prompt") + "\n")
+	r.print(menuLine("ctx", "| history", "conversation (ctx includes system prompt)") + "\n")
+	r.print(menuLine("last", "", "most recent tool result") + "\n")
+	r.print(menuLine("raw", "", "raw inbound request JSON") + "\n")
+	r.print(menuLine("exit", "| quit", "end the turn and quit") + "\n")
 
-Inspect (no effect on the harness):
-  tools                list offered tool names (changes since last turn flagged)
-  help <Tool>          show one tool's full description
-  schema <Tool>        show a tool's full input schema
-  template <Tool>      print a JSON skeleton for a tool's input to edit
-  sys                  show the system prompt
-  ctx | history        show conversation (ctx includes system prompt)
-  last                 show the most recent tool result
-  raw                  dump the raw inbound request JSON
-  help                 this help
-  exit | quit          end the turn and quit the console
-  (Tab completes commands and tool names; Ctrl+C on an empty line, or Ctrl+D, quits)
-`)
+	r.print("\n" + sSep.Render("  Tab completes commands and tool names; Ctrl+C on an empty line, or Ctrl+D, quits.") + "\n\n")
 }
 
 func (r *REPL) shellHelp() {
-	r.printf(`
-shell mode: type a command and press Enter to run it through %q. This is an ACT:
-the harness runs each command and returns its output.
-meta-commands (':' prefix):
-  :exit            leave shell mode, back to the normal console
-  :reply [msg]     REPLY in words and end the agent's turn (aliases: :say :text :end)
-  :call <T> <in>   author a one-off call to a different tool
-  :tools :ctx      show offered tools / conversation
-  :last :raw :sys  show last result / raw request / system prompt
-  :quit            quit the console
-`, r.shellTool)
+	r.print("\n" + menuHead("SHELL MODE", "each line runs through "+r.shellTool) + "\n")
+	r.print(menuLine(":exit", "", "back to the normal console") + "\n")
+	r.print(menuLine(":reply", "[msg]", "answer in words, end the turn (:say :text :end)") + "\n")
+	r.print(menuLine(":call", "<tool> <input>", "one-off call to a different tool") + "\n")
+	r.print(menuLine(":tools", "| :ctx", "offered tools / conversation") + "\n")
+	r.print(menuLine(":last", "| :raw | :sys", "last result / raw request / system prompt") + "\n")
+	r.print(menuLine(":quit", "", "quit the console") + "\n\n")
 }
 
 func findShellTool(req *neutral.Request) (name, field string, found bool) {
@@ -568,6 +557,16 @@ func providerColor(p string) lipgloss.Color {
 	default:
 		return cAccent // blue
 	}
+}
+
+// menuHead renders a section heading for the command menu: the section name in
+// the accent color, with a short parenthetical note in gray.
+func menuHead(name, note string) string {
+	line := sTitle.Render(name)
+	if note != "" {
+		line += sSep.Render("  (" + note + ")")
+	}
+	return line
 }
 
 // menuLine renders one command-menu row: the command keyword in white, its

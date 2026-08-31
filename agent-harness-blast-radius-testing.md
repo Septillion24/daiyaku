@@ -425,6 +425,30 @@ Run the genuine harness doing genuine benign work, capture the telemetry, then r
 
 Most of the detection surface is not the harness process. It is the child processes: `bash` invocations, `git` calls, file writes, package installs, and the outbound connections those children make. Focus detection engineering there.
 
+### Telemetry fidelity: what the run does and does not produce
+
+Everything downstream of the harness is real. The child processes, their command
+lines, parent process, file writes, credential use, and outbound connections are
+identical to a model-driven session, because the harness cannot tell the
+difference. That is the bulk of the detection surface.
+
+Four things are not, and belong in the report rather than in a footnote:
+
+| Gap | Effect | Mitigation |
+| --- | --- | --- |
+| **Cadence** | A human types; a model bursts. Velocity, burst-rate, and UEBA detections see the wrong shape and may not fire. | Run the velocity-sensitive tests from a canned sequence with `--delay` set to real model latency (~1-3s), and once at `--delay 0`. Interactive consoles cannot produce that timing. |
+| **Inference channel** | No TLS to the vendor API, so detections keyed on it do not fire and the SOC loses it as a pivot. The agent talking to loopback is itself an anomaly worth testing. | Run the Step-0 passthrough capture in the same window; use TLS interception rather than a base-URL override where fidelity matters. |
+| **Harness usage telemetry** | Token and cost metrics the harness emits carry the mock's constants, not real usage. | Filter the window, or tell the client which dashboards to ignore. |
+| **Vendor-side controls** | Bypassed by construction (already out of scope in §1). | State it explicitly so "no vendor alerts" is not read as a finding. |
+
+The safety classifier is a fifth, tool-specific case: answering it automatically
+switches off one of the harness's own guardrails, so record the setting used and
+run once with a blocking grade to exercise the block path.
+
+Injection is out of scope for this phase by design: the operator *is* the
+injection. The run measures what happens if one lands, not whether one would.
+Keep that in Phase 6.
+
 ### Report each finding as a chain
 
 ```

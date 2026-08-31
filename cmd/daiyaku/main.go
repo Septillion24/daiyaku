@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -26,6 +27,7 @@ import (
 var version = "0.1.0"
 
 func main() {
+	server.SetVersion(version)
 	args := os.Args[1:]
 	if len(args) == 0 {
 		serveOrExit(profile{}, nil)
@@ -36,6 +38,13 @@ func main() {
 		serveOrExit(profile{}, args[1:])
 	case "env":
 		runEnv(args[1:])
+	case "intercept":
+		if err := runIntercept(args[1:]); err != nil {
+			if err != flag.ErrHelp {
+				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			}
+			os.Exit(1)
+		}
 	case "report":
 		if err := runReport(args[1:]); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -108,6 +117,7 @@ func usage() {
 USAGE:
   daiyaku [serve] [flags]    run the mock server + console (default command)
   daiyaku <profile> [flags]  serve with a preset: codex | claude
+  daiyaku intercept [flags]  answer at the vendor's own address; the harness gets no config
   daiyaku env [flags]        print harness-redirection setup and revert commands
   daiyaku report <run-dir>   summarize a session + emit a replayable sequence
   daiyaku providers          list available provider adapters
@@ -145,27 +155,7 @@ func parseServeFlags(prof profile, args []string) (*flags, error) {
 	f := &flags{}
 	fs := newFlagSet("serve")
 
-	// flag > env > profile > built-in default.
-	provider := firstSet(os.Getenv("DAIYAKU_PROVIDER"), prof.provider, "anthropic")
-	addr := firstSet(os.Getenv("DAIYAKU_ADDR"), prof.addr, "127.0.0.1:8787")
-	mode := envOr("DAIYAKU_MODE", "repl")
-
-	fs.StringVar(&f.provider, "provider", provider, "provider adapter (anthropic, openai)")
-	fs.StringVar(&f.provider, "p", provider, "alias for -provider")
-	fs.StringVar(&f.addr, "addr", addr, "listen address: host:port, :port, or bare port")
-	fs.StringVar(&f.addr, "a", addr, "alias for -addr")
-	fs.StringVar(&f.mode, "mode", mode, "operator console: tui, repl, canned, passthrough")
-	fs.StringVar(&f.mode, "m", mode, "alias for -mode")
-	fs.StringVar(&f.seqFile, "sequence", "", "canned mode: path to a sequence JSON file")
-	fs.StringVar(&f.seqFile, "s", "", "alias for -sequence")
-	fs.StringVar(&f.record, "record", "", "append authored actions to this sequence file")
-	fs.StringVar(&f.record, "r", "", "alias for -record")
-	fs.DurationVar(&f.delay, "delay", 400*time.Millisecond, "canned mode: delay between steps")
-	fs.BoolVar(&f.fallback, "fallback", true, "canned mode: hand the tail to the operator when the sequence runs out (false: end the turn and stop)")
-	fs.StringVar(&f.runsDir, "runs-dir", "runs", "base directory for per-session evidence")
-	fs.StringVar(&f.upstream, "upstream", "", "passthrough mode: real upstream base URL to proxy to (e.g. https://api.anthropic.com)")
-	fs.StringVar(&f.upstream, "u", "", "alias for -upstream")
-	fs.IntVar(&f.classGrade, "classifier-severity", 0, "canned grade for the harness safety-classifier side-call, 0-100 (50 is its allow/block line, so 0 allows and 80 blocks); -1 leaves the calls to the operator")
+	registerServeFlags(fs, prof, f)
 
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `usage: daiyaku [serve] [flags]
@@ -198,28 +188,37 @@ precedence: flag > env > profile > built-in default.
 	return f, nil
 }
 
-func runServe(prof profile, args []string) error {
-	f, err := parseServeFlags(prof, args)
-	if err != nil {
-		return err
-	}
+// runtimeParts is everything a run needs once the flags are settled: the
+// evidence directory, the broker, and the mock. Both serve and intercept build
+// it the same way, so the classifier wiring and the transcript layout cannot
+// drift between the two.
+type runtimeParts struct {
+	srv        *server.Server
+	eng        *engine.Engine
+	tx         *server.Transcript
+	sessionDir string
+}
+
+func setupRuntime(f *flags, extraNotes map[string]string) (*runtimeParts, error) {
 	a, ok := adapter.New(f.provider)
 	if !ok {
-		return fmt.Errorf("unknown provider %q (have: %s)", f.provider, strings.Join(adapter.Providers(), ", "))
+		return nil, fmt.Errorf("unknown provider %q (have: %s)", f.provider, strings.Join(adapter.Providers(), ", "))
 	}
-
 	sessionDir, err := server.NewSessionDir(f.runsDir, time.Now())
 	if err != nil {
-		return fmt.Errorf("create session dir: %w", err)
+		return nil, fmt.Errorf("create session dir: %w", err)
 	}
 	tx, err := server.NewTranscript(sessionDir)
 	if err != nil {
-		return fmt.Errorf("open transcript: %w", err)
+		return nil, fmt.Errorf("open transcript: %w", err)
 	}
-	defer tx.Close()
-	tx.Note("session-start", map[string]string{
+	note := map[string]string{
 		"provider": f.provider, "addr": f.addr, "mode": f.mode, "version": version,
-	})
+	}
+	for k, v := range extraNotes {
+		note[k] = v
+	}
+	tx.Note("session-start", note)
 
 	eng := engine.New(0)
 	if f.classGrade >= 0 {
@@ -234,7 +233,22 @@ func runServe(prof profile, args []string) error {
 			}, true
 		}
 	}
-	srv := server.New(a, eng, tx, f.addr)
+	return &runtimeParts{
+		srv: server.New(a, eng, tx, f.addr), eng: eng, tx: tx, sessionDir: sessionDir,
+	}, nil
+}
+
+func runServe(prof profile, args []string) error {
+	f, err := parseServeFlags(prof, args)
+	if err != nil {
+		return err
+	}
+	rt, err := setupRuntime(f, nil)
+	if err != nil {
+		return err
+	}
+	defer rt.tx.Close()
+	srv, eng, sessionDir := rt.srv, rt.eng, rt.sessionDir
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -253,10 +267,30 @@ func runServe(prof profile, args []string) error {
 		return runPassthrough(ctx, cancel, srv, f, sessionDir)
 	}
 
+	return runConsoleLoop(ctx, cancel, srv, f, eng, sessionDir,
+		func() { banner(f, sessionDir) }, nil)
+}
+
+// runConsoleLoop starts the mock and the operator console and blocks until one
+// of them stops or the process is signalled. onReady prints whatever banner the
+// caller wants once the server is up. cleanup always runs before returning,
+// including on a forced second signal, because intercept mode has machine
+// changes that must not outlive the process.
+func runConsoleLoop(ctx context.Context, cancel context.CancelFunc, srv *server.Server,
+	f *flags, eng *engine.Engine, sessionDir string, onReady, cleanup func()) error {
+
 	con, err := buildConsole(f, eng, sessionDir)
 	if err != nil {
 		return err
 	}
+
+	var once sync.Once
+	runCleanup := func() {
+		if cleanup != nil {
+			once.Do(cleanup)
+		}
+	}
+	defer runCleanup()
 
 	sigc := make(chan os.Signal, 2)
 	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)
@@ -264,14 +298,17 @@ func runServe(prof profile, args []string) error {
 		<-sigc
 		fmt.Fprintln(os.Stderr, "\nshutting down...")
 		cancel()
-		<-sigc // a second signal forces exit even if a console is blocked on stdin
+		<-sigc       // a second signal forces exit even if a console is blocked on stdin
+		runCleanup() // never leave the machine redirected, even on a forced exit
 		os.Exit(1)
 	}()
 
 	srvErr := make(chan error, 1)
 	go func() { srvErr <- srv.ListenAndServe(ctx) }()
 
-	banner(f, sessionDir)
+	if onReady != nil {
+		onReady()
+	}
 
 	conErr := make(chan error, 1)
 	go func() { conErr <- con.Run(ctx) }()
@@ -280,6 +317,7 @@ func runServe(prof profile, args []string) error {
 		return err
 	}
 	time.Sleep(150 * time.Millisecond) // let the server drain before the process exits
+	runCleanup()
 	fmt.Printf("\nlog saved to %s\n", absPath(sessionDir))
 	return nil
 }
@@ -374,4 +412,31 @@ func banner(f *flags, sessionDir string) {
 		fmt.Printf("    serves the harness conversation to anyone who can reach this port.\n")
 	}
 	fmt.Printf("  run 'daiyaku env' for setup.\n")
+}
+
+// registerServeFlags declares the flags every serving mode shares, so intercept
+// takes the same console, recording, and classifier options as serve without a
+// second copy that can drift.
+func registerServeFlags(fs *flag.FlagSet, prof profile, f *flags) {
+	// flag > env > profile > built-in default.
+	provider := firstSet(os.Getenv("DAIYAKU_PROVIDER"), prof.provider, "anthropic")
+	addr := firstSet(os.Getenv("DAIYAKU_ADDR"), prof.addr, "127.0.0.1:8787")
+	mode := envOr("DAIYAKU_MODE", "repl")
+
+	fs.StringVar(&f.provider, "provider", provider, "provider adapter (anthropic, openai)")
+	fs.StringVar(&f.provider, "p", provider, "alias for -provider")
+	fs.StringVar(&f.addr, "addr", addr, "listen address: host:port, :port, or bare port")
+	fs.StringVar(&f.addr, "a", addr, "alias for -addr")
+	fs.StringVar(&f.mode, "mode", mode, "operator console: tui, repl, canned, passthrough")
+	fs.StringVar(&f.mode, "m", mode, "alias for -mode")
+	fs.StringVar(&f.seqFile, "sequence", "", "canned mode: path to a sequence JSON file")
+	fs.StringVar(&f.seqFile, "s", "", "alias for -sequence")
+	fs.StringVar(&f.record, "record", "", "append authored actions to this sequence file")
+	fs.StringVar(&f.record, "r", "", "alias for -record")
+	fs.DurationVar(&f.delay, "delay", 400*time.Millisecond, "canned mode: delay between steps")
+	fs.BoolVar(&f.fallback, "fallback", true, "canned mode: hand the tail to the operator when the sequence runs out (false: end the turn and stop)")
+	fs.StringVar(&f.runsDir, "runs-dir", "runs", "base directory for per-session evidence")
+	fs.StringVar(&f.upstream, "upstream", "", "passthrough mode: real upstream base URL to proxy to (e.g. https://api.anthropic.com)")
+	fs.StringVar(&f.upstream, "u", "", "alias for -upstream")
+	fs.IntVar(&f.classGrade, "classifier-severity", 0, "canned grade for the harness safety-classifier side-call, 0-100 (50 is its allow/block line, so 0 allows and 80 blocks); -1 leaves the calls to the operator")
 }

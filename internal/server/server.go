@@ -7,6 +7,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -25,12 +26,17 @@ type Server struct {
 	tx      *Transcript
 	mux     *http.ServeMux
 	http    *http.Server
+	tls     *tls.Config
 	addr    string
 	proxy   *Proxy
 	seq     int64
 }
 
 func (s *Server) SetProxy(p *Proxy) { s.proxy = p }
+
+// SetTLS makes ListenAndServe terminate TLS with cfg, which is how intercept
+// mode answers at the vendor's own https address.
+func (s *Server) SetTLS(cfg *tls.Config) { s.tls = cfg }
 
 func New(a adapter.Adapter, e *engine.Engine, tx *Transcript, addr string) *Server {
 	s := &Server{adapter: a, engine: e, tx: tx, mux: http.NewServeMux(), addr: addr}
@@ -54,7 +60,13 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		defer cancel()
 		s.http.Shutdown(shutCtx)
 	}()
-	err := s.http.ListenAndServe()
+	var err error
+	if s.tls != nil {
+		s.http.TLSConfig = s.tls
+		err = s.http.ListenAndServeTLS("", "") // certs come from TLSConfig.GetCertificate
+	} else {
+		err = s.http.ListenAndServe()
+	}
 	if err == http.ErrServerClosed {
 		return nil
 	}
@@ -65,6 +77,10 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 // feature probes and unexpected calls.
 func (s *Server) logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Marks every response as daiyaku's. Clients ignore unknown headers, and
+		// it lets intercept mode prove it is the thing answering for the vendor
+		// address rather than something else on the machine.
+		w.Header().Set("x-daiyaku", version)
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rec, r)
 		if rec.status == http.StatusNotFound {
@@ -230,4 +246,15 @@ func headerSnapshot(h http.Header) map[string]string {
 		out[strings.ToLower(k)] = strings.Join(v, ", ")
 	}
 	return out
+}
+
+// version identifies the mock in the x-daiyaku response header. It is set from
+// main at startup; the default keeps the header non-empty in tests.
+var version = "dev"
+
+// SetVersion records the build version used in the x-daiyaku header.
+func SetVersion(v string) {
+	if v != "" {
+		version = v
+	}
 }

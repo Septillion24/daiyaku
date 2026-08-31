@@ -70,6 +70,58 @@ the session still wins over the profile's port. `daiyaku -h` for everything.
    Compose a tool call, send it, and the harness runs it and posts the result
    back as the next request.
 
+## Intercept mode (no harness config at all)
+
+The setup above tells the harness where the model lives. The harness can tell,
+and some of its behaviour changes when it sees a non-standard base URL, which
+matters because the offered tool surface is exactly what Phase 1 measures.
+
+Intercept mode removes that. It answers at the vendor's own address, so the
+harness resolves `api.anthropic.com` to this machine, is handed a certificate for
+that name, and is given no base URL and no token. It uses its real login, which
+also means the transcript evidences that the real agent credential was sent.
+
+```bash
+daiyaku intercept          # anthropic on 127.0.0.1:443
+daiyaku intercept -p openai
+daiyaku intercept --check  # is this machine ready? changes nothing
+daiyaku intercept --revert # put this machine back
+```
+
+It needs an elevated terminal, because it edits the hosts file. Then, in the
+shell you start the harness from:
+
+```powershell
+$env:NODE_EXTRA_CA_CERTS = "C:\Users\you\AppData\Roaming\daiyaku\ca.crt"
+```
+
+daiyaku prints that line with the real path. `--trust-store` installs the CA
+machine-wide instead, and then the harness needs nothing at all, at the cost of a
+larger change to undo.
+
+**It redirects the vendor hostname for every program on the machine, not only the
+harness under test.** Use a test VM, or expect your own Claude tools to be
+redirected too. Only the inference host is taken over: auth, telemetry, and
+update endpoints keep working.
+
+### What it changes, and how it puts things back
+
+One tagged line in the hosts file, and the DNS cache flushed. That is all, unless
+you pass `--trust-store`. Before starting, it verifies the whole path itself by
+resolving the vendor name, connecting, and checking the certificate chain, so a
+broken setup is reported here rather than as a Node TLS error mid-session.
+
+Cleanup runs on exit, including on Ctrl+C. If the process is killed hard, the
+next start finds the record it left, says what is still redirected, and takes it
+over; `daiyaku intercept --revert` undoes it from any shell. An entry the machine
+already had for an intercepted name is commented out rather than overwritten, and
+restored on revert. If the name already resolves here (a test VM whose DNS
+already points at you) nothing is changed at all and no privilege is needed.
+
+To verify by hand with curl on Windows, add `--ssl-revoke-best-effort`: schannel
+refuses a private CA that publishes no revocation endpoint. Node, which is what
+Claude Code uses, does not.
+
 ## Quickstart (Codex CLI)
 
 Codex uses the OpenAI Responses wire format and reads provider config from
@@ -235,6 +287,9 @@ Unset the env vars, remove any `env` block you added to
 `~/.claude/settings.json` (or the `[model_providers.*]` block in
 `~/.codex/config.toml`), and restart the harness.
 
+If you used intercept mode, `daiyaku intercept --revert` undoes the hosts entry
+and the CA. It also runs automatically when the process exits.
+
 ## Safety
 
 Read the methodology's §2 first. Default to read-only; require a named written
@@ -261,4 +316,5 @@ rate limiting, vendor audit logging) are bypassed by construction; test them
 separately. Results have a short shelf life, so re-test on harness/model/MCP
 changes and ship the sequences so the client can. MCP tool-search behaves
 differently under base-URL redirection in Claude Code, so the exposed tool surface
-may not exactly match production.
+may not exactly match production; `daiyaku intercept` avoids that by leaving the
+harness pointed at the vendor address.
