@@ -47,25 +47,33 @@ func RenderTools(req *neutral.Request, prev []string) string {
 	b.WriteString(wrapList(names, "  ", 72))
 
 	if prev != nil {
-		var added, removed []string
-		for _, t := range req.Tools {
-			if !prevSet[t.Label()] {
-				added = append(added, t.Label())
-			}
+		b.WriteString(toolDiff(req, prev, prevSet, curSet))
+	}
+	return b.String()
+}
+
+// toolDiff renders the added/removed lines between the previous turn's tool set
+// and this one. prevSet/curSet are the label sets of prev and req respectively.
+func toolDiff(req *neutral.Request, prev []string, prevSet, curSet map[string]bool) string {
+	var added, removed []string
+	for _, t := range req.Tools {
+		if !prevSet[t.Label()] {
+			added = append(added, t.Label())
 		}
-		for _, n := range prev {
-			if !curSet[n] {
-				removed = append(removed, n)
-			}
+	}
+	for _, n := range prev {
+		if !curSet[n] {
+			removed = append(removed, n)
 		}
-		sort.Strings(added)
-		sort.Strings(removed)
-		if len(added) > 0 {
-			fmt.Fprintf(&b, "  + new this turn: %s\n", strings.Join(added, ", "))
-		}
-		if len(removed) > 0 {
-			fmt.Fprintf(&b, "  - no longer offered: %s\n", strings.Join(removed, ", "))
-		}
+	}
+	sort.Strings(added)
+	sort.Strings(removed)
+	var b strings.Builder
+	if len(added) > 0 {
+		fmt.Fprintf(&b, "  + new this turn: %s\n", strings.Join(added, ", "))
+	}
+	if len(removed) > 0 {
+		fmt.Fprintf(&b, "  - no longer offered: %s\n", strings.Join(removed, ", "))
 	}
 	return b.String()
 }
@@ -130,26 +138,31 @@ func RenderContext(req *neutral.Request, showSystem bool) string {
 	for _, turn := range req.Turns {
 		fmt.Fprintf(&b, "[%s]\n", turn.Role)
 		for _, bl := range turn.Blocks {
-			switch bl.Type {
-			case neutral.BlockText:
-				b.WriteString(indent(bl.Text, "  "))
-			case neutral.BlockToolCall:
-				if bl.Call != nil {
-					fmt.Fprintf(&b, "  ->call %s %s\n", bl.Call.Name, oneLine(string(bl.Call.Input)))
-				}
-			case neutral.BlockToolResult:
-				if bl.Result != nil {
-					tag := "result"
-					if bl.Result.IsError {
-						tag = "result(ERROR)"
-					}
-					fmt.Fprintf(&b, "  <-%s %s\n", tag, indent(truncate(bl.Result.Content, 2000), "    "))
-				}
-			}
+			renderBlock(&b, bl)
 		}
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+// renderBlock writes a single conversation block (text, tool call, or tool result).
+func renderBlock(b *strings.Builder, bl neutral.Block) {
+	switch bl.Type {
+	case neutral.BlockText:
+		b.WriteString(indent(bl.Text, "  "))
+	case neutral.BlockToolCall:
+		if bl.Call != nil {
+			fmt.Fprintf(b, "  ->call %s %s\n", bl.Call.Name, oneLine(string(bl.Call.Input)))
+		}
+	case neutral.BlockToolResult:
+		if bl.Result != nil {
+			tag := "result"
+			if bl.Result.IsError {
+				tag = "result(ERROR)"
+			}
+			fmt.Fprintf(b, "  <-%s %s", tag, indent(truncate(bl.Result.Content, 2000), "    "))
+		}
+	}
 }
 
 func Template(req *neutral.Request, name string) string {
@@ -157,12 +170,22 @@ func Template(req *neutral.Request, name string) string {
 	if t == nil {
 		return "{}"
 	}
-	v := skeleton(t.Schema)
-	b, err := json.MarshalIndent(v, "", "  ")
+	b, err := json.MarshalIndent(templateValue(t.Schema), "", "  ")
 	if err != nil {
 		return "{}"
 	}
 	return string(b)
+}
+
+// templateValue is skeleton with an empty object as the floor. A tool with no
+// schema at all (Anthropic server tools), a union type ("type":["object","null"])
+// or a $ref-only schema all make skeleton give up, and rendering that as the
+// literal "null" hands the operator a template they cannot edit into a call.
+func templateValue(schema json.RawMessage) interface{} {
+	if v := skeleton(schema); v != nil {
+		return v
+	}
+	return map[string]interface{}{}
 }
 
 func TemplateCompact(req *neutral.Request, name string) string {
@@ -170,7 +193,7 @@ func TemplateCompact(req *neutral.Request, name string) string {
 	if t == nil {
 		return "{}"
 	}
-	b, err := json.Marshal(skeleton(t.Schema))
+	b, err := json.Marshal(templateValue(t.Schema))
 	if err != nil {
 		return "{}"
 	}
@@ -196,16 +219,7 @@ func skeleton(raw json.RawMessage) interface{} {
 	}
 	switch s.Type {
 	case "object":
-		m := map[string]interface{}{}
-		keys := make([]string, 0, len(s.Properties))
-		for k := range s.Properties {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			m[k] = skeleton(s.Properties[k])
-		}
-		return m
+		return skeletonObject(s.Properties)
 	case "array":
 		return []interface{}{skeleton(s.Items)}
 	case "string":
@@ -217,6 +231,21 @@ func skeleton(raw json.RawMessage) interface{} {
 	default:
 		return nil
 	}
+}
+
+// skeletonObject builds a placeholder object with one skeleton value per property,
+// keys walked in sorted order so the emitted template is deterministic.
+func skeletonObject(props map[string]json.RawMessage) map[string]interface{} {
+	m := map[string]interface{}{}
+	keys := make([]string, 0, len(props))
+	for k := range props {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		m[k] = skeleton(props[k])
+	}
+	return m
 }
 
 func oneLine(s string) string {

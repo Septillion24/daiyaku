@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -16,8 +17,9 @@ import (
 	_ "daiyaku/internal/adapter/openai"
 	"daiyaku/internal/console"
 	"daiyaku/internal/engine"
-	"daiyaku/internal/server"
+	"daiyaku/internal/neutral"
 	"daiyaku/internal/sequence"
+	"daiyaku/internal/server"
 )
 
 // Overridable at build time with -ldflags "-X main.version=...".
@@ -26,12 +28,12 @@ var version = "0.1.0"
 func main() {
 	args := os.Args[1:]
 	if len(args) == 0 {
-		serveOrExit(nil)
+		serveOrExit(profile{}, nil)
 		return
 	}
 	switch args[0] {
 	case "serve":
-		serveOrExit(args[1:])
+		serveOrExit(profile{}, args[1:])
 	case "env":
 		runEnv(args[1:])
 	case "report":
@@ -40,39 +42,58 @@ func main() {
 			os.Exit(1)
 		}
 	case "providers":
-		for _, p := range adapter.Providers() {
-			fmt.Println(p)
-		}
+		printProviders()
 	case "version", "-v", "--version":
 		fmt.Printf("daiyaku %s\n", version)
 	case "help", "-h", "--help":
 		usage()
 	default:
-		if prof, ok := profiles[args[0]]; ok {
-			serveOrExit(append(append([]string{}, prof...), args[1:]...))
-			return
-		}
-		if strings.HasPrefix(args[0], "-") {
-			serveOrExit(args)
-			return
-		}
-		fmt.Fprintf(os.Stderr, "unknown command: %s\n\n", args[0])
-		usage()
-		os.Exit(2)
+		runDefault(args)
 	}
 }
 
-// One-word launch presets: provider + conventional port, so codex (8790) and
-// claude (8787) can run at once. Trailing flags still override.
-var profiles = map[string][]string{
-	"codex":     {"-p", "openai", "-a", "8790"},
-	"openai":    {"-p", "openai", "-a", "8790"},
-	"claude":    {"-p", "anthropic", "-a", "8787"},
-	"anthropic": {"-p", "anthropic", "-a", "8787"},
+func printProviders() {
+	ps := adapter.Providers()
+	sort.Strings(ps) // registry is a map; unsorted output changes run to run
+	for _, p := range ps {
+		fmt.Println(p)
+	}
 }
 
-func serveOrExit(args []string) {
-	if err := runServe(args); err != nil {
+// runDefault handles a first argument that is not a known subcommand: a launch
+// profile name, bare serve flags (leading '-'), or an unknown command.
+func runDefault(args []string) {
+	if prof, ok := profiles[args[0]]; ok {
+		serveOrExit(prof, args[1:])
+		return
+	}
+	if strings.HasPrefix(args[0], "-") {
+		serveOrExit(profile{}, args)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "unknown command: %s\n\n", args[0])
+	usage()
+	os.Exit(2)
+}
+
+// A one-word launch preset: provider + conventional port, so codex (8790) and
+// claude (8787) can run at once. A preset only seeds defaults, so precedence
+// stays flag > env > profile > built-in default: a DAIYAKU_ADDR you exported for
+// the session is not silently overruled by typing "daiyaku codex".
+type profile struct {
+	provider string
+	addr     string
+}
+
+var profiles = map[string]profile{
+	"codex":     {provider: "openai", addr: "8790"},
+	"openai":    {provider: "openai", addr: "8790"},
+	"claude":    {provider: "anthropic", addr: "8787"},
+	"anthropic": {provider: "anthropic", addr: "8787"},
+}
+
+func serveOrExit(prof profile, args []string) {
+	if err := runServe(prof, args); err != nil {
 		if err == flag.ErrHelp {
 			return
 		}
@@ -98,32 +119,35 @@ COMMON:
   daiyaku -m tui             full-screen TUI console
 
 Short flags:   -p provider, -a addr (host:port, :port, or bare port), -m mode
-Profiles:      codex, claude (preset provider + conventional port; flags override)
+Profiles:      codex, claude (preset provider + conventional port)
 Env defaults:  DAIYAKU_PROVIDER, DAIYAKU_ADDR, DAIYAKU_MODE
                (set one to make it your default, then just run 'daiyaku')
+Precedence:    flag > env > profile > built-in default
 
 Run 'daiyaku -h' for all serve flags.
 `)
 }
 
 type flags struct {
-	provider string
-	addr     string
-	mode     string
-	seqFile  string
-	record   string
-	delay    time.Duration
-	fallback bool
-	runsDir  string
-	upstream string
+	provider   string
+	addr       string
+	mode       string
+	seqFile    string
+	record     string
+	delay      time.Duration
+	fallback   bool
+	runsDir    string
+	upstream   string
+	classGrade int
 }
 
-func parseServeFlags(args []string) (*flags, error) {
+func parseServeFlags(prof profile, args []string) (*flags, error) {
 	f := &flags{}
 	fs := newFlagSet("serve")
 
-	provider := envOr("DAIYAKU_PROVIDER", "anthropic")
-	addr := envOr("DAIYAKU_ADDR", "127.0.0.1:8787")
+	// flag > env > profile > built-in default.
+	provider := firstSet(os.Getenv("DAIYAKU_PROVIDER"), prof.provider, "anthropic")
+	addr := firstSet(os.Getenv("DAIYAKU_ADDR"), prof.addr, "127.0.0.1:8787")
 	mode := envOr("DAIYAKU_MODE", "repl")
 
 	fs.StringVar(&f.provider, "provider", provider, "provider adapter (anthropic, openai)")
@@ -141,6 +165,7 @@ func parseServeFlags(args []string) (*flags, error) {
 	fs.StringVar(&f.runsDir, "runs-dir", "runs", "base directory for per-session evidence")
 	fs.StringVar(&f.upstream, "upstream", "", "passthrough mode: real upstream base URL to proxy to (e.g. https://api.anthropic.com)")
 	fs.StringVar(&f.upstream, "u", "", "alias for -upstream")
+	fs.IntVar(&f.classGrade, "classifier-severity", 0, "auto-answer the harness safety classifier with this severity (0=allow); -1 disables and lets the operator handle it")
 
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `usage: daiyaku [serve] [flags]
@@ -157,20 +182,24 @@ examples:
   daiyaku codex              REPL for Codex/OpenAI on 127.0.0.1:8790
   daiyaku -m tui             full-screen TUI console
 
-profiles: codex, claude preset provider + port (trailing flags override).
-env:      DAIYAKU_PROVIDER, DAIYAKU_ADDR, DAIYAKU_MODE seed defaults.
+profiles:   codex, claude preset provider + port.
+env:        DAIYAKU_PROVIDER, DAIYAKU_ADDR, DAIYAKU_MODE seed defaults.
+precedence: flag > env > profile > built-in default.
 `)
 	}
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
-	f.addr = normalizeAddr(f.addr)
+	var err error
+	if f.addr, err = normalizeAddr(f.addr); err != nil {
+		return nil, err
+	}
 	return f, nil
 }
 
-func runServe(args []string) error {
-	f, err := parseServeFlags(args)
+func runServe(prof profile, args []string) error {
+	f, err := parseServeFlags(prof, args)
 	if err != nil {
 		return err
 	}
@@ -179,7 +208,10 @@ func runServe(args []string) error {
 		return fmt.Errorf("unknown provider %q (have: %s)", f.provider, strings.Join(adapter.Providers(), ", "))
 	}
 
-	sessionDir := filepath.Join(f.runsDir, time.Now().Format("20060102-150405"))
+	sessionDir, err := server.NewSessionDir(f.runsDir, time.Now())
+	if err != nil {
+		return fmt.Errorf("create session dir: %w", err)
+	}
 	tx, err := server.NewTranscript(sessionDir)
 	if err != nil {
 		return fmt.Errorf("open transcript: %w", err)
@@ -190,6 +222,18 @@ func runServe(args []string) error {
 	})
 
 	eng := engine.New(0)
+	if f.classGrade >= 0 {
+		grade := f.classGrade
+		eng.Auto = func(req *neutral.Request) (neutral.Action, bool) {
+			if !req.IsSafetyClassifier() {
+				return neutral.Action{}, false
+			}
+			return neutral.Action{
+				Kind: neutral.ActionEnd,
+				Text: fmt.Sprintf("<severity>%d</severity>", grade),
+			}, true
+		}
+	}
 	srv := server.New(a, eng, tx, f.addr)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -226,6 +270,17 @@ func runServe(args []string) error {
 	conErr := make(chan error, 1)
 	go func() { conErr <- con.Run(ctx) }()
 
+	if err := waitForShutdown(ctx, cancel, srvErr, conErr); err != nil {
+		return err
+	}
+	time.Sleep(150 * time.Millisecond) // let the server drain before the process exits
+	fmt.Printf("\nlog saved to %s\n", absPath(sessionDir))
+	return nil
+}
+
+// waitForShutdown blocks until the context is cancelled or the server or console
+// goroutine returns, cancelling the context on a console exit or a server error.
+func waitForShutdown(ctx context.Context, cancel context.CancelFunc, srvErr, conErr <-chan error) error {
 	select {
 	case <-ctx.Done():
 	case err := <-srvErr:
@@ -239,8 +294,6 @@ func runServe(args []string) error {
 			return fmt.Errorf("console: %w", err)
 		}
 	}
-	time.Sleep(150 * time.Millisecond) // let the server drain before the process exits
-	fmt.Printf("\nlog saved to %s\n", absPath(sessionDir))
 	return nil
 }
 
@@ -293,7 +346,7 @@ func buildConsole(f *flags, eng *engine.Engine, sessionDir string) (console.Cons
 		if f.fallback {
 			fb = console.NewREPL(eng, f.provider, sessionDir, f.record)
 		}
-		return console.NewCanned(eng, f.provider, sf, f.delay, fb), nil
+		return console.NewCanned(eng, f.provider, sf, f.delay, f.record, fb), nil
 	default:
 		return nil, fmt.Errorf("unknown mode %q (tui, repl, canned)", f.mode)
 	}
@@ -304,6 +357,15 @@ func banner(f *flags, sessionDir string) {
 	fmt.Printf("  provider : %s\n", f.provider)
 	fmt.Printf("  listening: http://%s\n", f.addr)
 	fmt.Printf("  mode     : %s\n", f.mode)
+	if f.classGrade >= 0 {
+		fmt.Printf("  classifier: auto-grade severity %d (safety classifier answered without you)\n", f.classGrade)
+	} else {
+		fmt.Printf("  classifier: manual (operator answers the safety classifier)\n")
+	}
 	fmt.Printf("  log: %s\n", sessionDir)
+	if !isLoopback(f.addr) {
+		fmt.Printf("  ! WARNING: %s is not loopback. The mock authenticates nothing and\n", f.addr)
+		fmt.Printf("    serves the harness conversation to anyone who can reach this port.\n")
+	}
 	fmt.Printf("  run 'daiyaku env' for setup.\n")
 }

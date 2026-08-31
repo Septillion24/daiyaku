@@ -24,8 +24,8 @@ var (
 	sTitle = lipgloss.NewStyle().Bold(true).Foreground(cAccent)
 	sSep   = lipgloss.NewStyle().Foreground(cDim)
 	sMuted = lipgloss.NewStyle().Foreground(cMuted)
-	sCmd   = lipgloss.NewStyle().Bold(true).Foreground(cWhite) // command keyword: pops white
-	sArg   = lipgloss.NewStyle().Foreground(cMuted)            // its args: gray
+	sCmd   = lipgloss.NewStyle()                    // command keyword: default text color
+	sArg   = lipgloss.NewStyle().Foreground(cMuted) // its args: gray
 	sWarn  = lipgloss.NewStyle().Foreground(cWarn)
 	sErr   = lipgloss.NewStyle().Foreground(cErr)
 	sOK    = lipgloss.NewStyle().Foreground(cGood)
@@ -47,6 +47,7 @@ type REPL struct {
 	shellTool  string
 	shellField string
 	quit       bool
+	lastAuto   int // AutoAnswered() total already reported, to show only new ones
 }
 
 func NewREPL(e *engine.Engine, provider, sessionDir, recordPath string) *REPL {
@@ -97,7 +98,7 @@ func (r *REPL) ensureReadline() {
 		AutoComplete:      r.completer(),
 		InterruptPrompt:   "^C",
 		EOFPrompt:         "exit",
-		HistoryFile:       filepath.Join(r.SessionDir, "repl_history"),
+		HistoryFile:       historyFile(),
 		HistorySearchFold: true,
 	})
 	if err == nil {
@@ -144,7 +145,7 @@ func (r *REPL) Run(ctx context.Context) error {
 			return nil
 		}
 		action := r.interact(ex.Req)
-		ex.Respond(action)
+		r.report(action, ex.Respond(action))
 		r.prevTools = ex.Req.ToolNames()
 		if r.quit {
 			return nil
@@ -201,6 +202,7 @@ func (r *REPL) interact(req *neutral.Request) neutral.Action {
 
 func (r *REPL) normalInteract(req *neutral.Request) neutral.Action {
 	r.print(sSep.Render(strings.Repeat("─", 72)) + "\n")
+	r.printQueueStatus()
 	r.print(sTitle.Render("REQUEST ") + Summarize(req) + "\n")
 	r.print(RenderTools(req, r.prevTools))
 	r.print(menuLine("call", "<tool> <json|text>", "run a tool (loop continues)") + "\n")
@@ -216,57 +218,104 @@ func (r *REPL) normalInteract(req *neutral.Request) neutral.Action {
 			return neutral.Action{Kind: neutral.ActionEnd}
 		}
 		cmd, rest := split2(strings.TrimSpace(line))
-		switch cmd {
-		case "":
-			continue
-		case "help", "?":
-			if rest != "" {
-				r.print(RenderToolHelp(req, rest) + "\n")
-			} else {
-				r.help()
-			}
-		case "tools":
-			r.print(RenderTools(req, r.prevTools))
-		case "schema":
-			if rest == "" {
-				r.printf("usage: schema <ToolName>\n")
-				continue
-			}
-			r.print(RenderSchema(req, rest) + "\n")
-		case "template", "tpl":
-			if rest == "" {
-				r.printf("usage: template <ToolName>\n")
-				continue
-			}
-			r.print(Template(req, rest) + "\n")
-		case "sys", "system":
-			if req.System == "" {
-				r.printf("(no system prompt)\n")
-			} else {
-				r.printf("%s\n", req.System)
-			}
-		case "ctx", "context", "history", "hist":
-			r.print(RenderContext(req, cmd == "ctx" || cmd == "context"))
-		case "last":
-			r.printLast(req)
-		case "raw":
-			r.printf("%s\n", string(req.Raw))
-		case "shell", "sh", "cmd", "pwsh", "powershell":
-			if r.enterShell(req, rest) {
-				return r.shellInteract(req)
-			}
-		case "call":
-			if action, ok := r.buildCall(req, rest); ok {
-				return r.record(action)
-			}
-		case "reply", "say", "text", "end", "msg":
-			return r.record(neutral.Action{Kind: neutral.ActionEnd, Text: rest})
-		case "exit", "quit":
-			r.quit = true
-			return neutral.Action{Kind: neutral.ActionEnd, Text: rest}
-		default:
-			r.print(sWarn.Render(fmt.Sprintf("unknown command %q (try 'help')", cmd)) + "\n")
+		if action, ret := r.handleNormalCmd(req, cmd, rest); ret {
+			return action
 		}
+	}
+}
+
+// printQueueStatus surfaces what happened out of band before this request: any
+// side-channel calls the engine auto-graded (so the operator knows they went by),
+// and how many requests are already queued behind this one (so a backlog is never
+// silent — an unanswered request is what stalled the harness in earlier runs).
+func (r *REPL) printQueueStatus() {
+	if r.Engine == nil {
+		return
+	}
+	if n := r.Engine.AutoAnswered(); n > r.lastAuto {
+		r.print(sMuted.Render(fmt.Sprintf("  ⟳ auto-graded %d safety-classifier request(s) since the last turn", n-r.lastAuto)) + "\n")
+		r.lastAuto = n
+	}
+	if w := r.Engine.Waiting() - 1; w > 0 {
+		r.print(sWarn.Render(fmt.Sprintf("  ⏳ %d more request(s) waiting behind this one", w)) + "\n")
+	}
+}
+
+// handleNormalCmd dispatches one normal-mode command. ret=true means the returned
+// action should be sent (leaving the prompt loop); ret=false continues the loop.
+func (r *REPL) handleNormalCmd(req *neutral.Request, cmd, rest string) (neutral.Action, bool) {
+	switch cmd {
+	case "call":
+		if action, ok := r.buildCall(req, rest); ok {
+			return action, true
+		}
+	case "reply", "say", "text", "end", "msg":
+		return neutral.Action{Kind: neutral.ActionEnd, Text: rest}, true
+	case "exit", "quit":
+		r.quit = true
+		return neutral.Action{Kind: neutral.ActionEnd, Text: rest}, true
+	case "shell", "sh", "cmd", "pwsh", "powershell":
+		if r.enterShell(req, rest) {
+			return r.shellInteract(req), true
+		}
+	case "":
+		// blank line: re-prompt
+	default:
+		if !r.handleToolQuery(req, cmd, rest) {
+			r.handleStateQuery(req, cmd)
+		}
+	}
+	return neutral.Action{}, false
+}
+
+// handleToolQuery handles the inspect commands that name a tool. It reports
+// whether it recognized cmd.
+func (r *REPL) handleToolQuery(req *neutral.Request, cmd, rest string) bool {
+	switch cmd {
+	case "help", "?":
+		if rest != "" {
+			r.print(RenderToolHelp(req, rest) + "\n")
+		} else {
+			r.help()
+		}
+	case "tools":
+		r.print(RenderTools(req, r.prevTools))
+	case "schema":
+		if rest != "" {
+			r.print(RenderSchema(req, rest) + "\n")
+		} else {
+			r.printf("usage: schema <ToolName>\n")
+		}
+	case "template", "tpl":
+		if rest != "" {
+			r.print(Template(req, rest) + "\n")
+		} else {
+			r.printf("usage: template <ToolName>\n")
+		}
+	default:
+		return false
+	}
+	return true
+}
+
+// handleStateQuery handles the inspect commands that show request state, and
+// reports unknown commands.
+func (r *REPL) handleStateQuery(req *neutral.Request, cmd string) {
+	switch cmd {
+	case "sys", "system":
+		if req.System == "" {
+			r.printf("(no system prompt)\n")
+		} else {
+			r.printf("%s\n", req.System)
+		}
+	case "ctx", "context", "history", "hist":
+		r.print(RenderContext(req, cmd == "ctx" || cmd == "context"))
+	case "last":
+		r.printLast(req)
+	case "raw":
+		r.printf("%s\n", string(req.Raw))
+	default:
+		r.print(sWarn.Render(fmt.Sprintf("unknown command %q (try 'help')", cmd)) + "\n")
 	}
 }
 
@@ -327,7 +376,7 @@ func (r *REPL) shellInteract(req *neutral.Request) neutral.Action {
 			continue
 		}
 		b, _ := json.Marshal(map[string]string{r.shellField: line})
-		return r.record(neutral.Action{Kind: neutral.ActionToolCall, ToolName: r.shellTool, ToolInput: b})
+		return neutral.Action{Kind: neutral.ActionToolCall, ToolName: r.shellTool, ToolInput: b}
 	}
 }
 
@@ -343,11 +392,20 @@ func (r *REPL) shellMeta(req *neutral.Request, s string) (neutral.Action, bool) 
 		r.quit = true
 		return neutral.Action{Kind: neutral.ActionEnd, Text: rest}, true
 	case "reply", "say", "text", "end":
-		return r.record(neutral.Action{Kind: neutral.ActionEnd, Text: rest}), true
+		return neutral.Action{Kind: neutral.ActionEnd, Text: rest}, true
 	case "call":
 		if action, ok := r.buildCall(req, rest); ok {
-			return r.record(action), true
+			return action, true
 		}
+	default:
+		r.shellMetaInspect(req, cmd)
+	}
+	return neutral.Action{}, false
+}
+
+// shellMetaInspect handles the read-only shell meta-commands, and reports unknown ones.
+func (r *REPL) shellMetaInspect(req *neutral.Request, cmd string) {
+	switch cmd {
 	case "tools":
 		r.print(RenderTools(req, r.prevTools))
 	case "ctx", "context", "history":
@@ -363,7 +421,6 @@ func (r *REPL) shellMeta(req *neutral.Request, s string) (neutral.Action, bool) 
 	default:
 		r.printf("unknown meta ':%s' (try :help)\n", cmd)
 	}
-	return neutral.Action{}, false
 }
 
 func (r *REPL) printLast(req *neutral.Request) {
@@ -414,7 +471,17 @@ func (r *REPL) buildCall(req *neutral.Request, rest string) (neutral.Action, boo
 	return neutral.Action{Kind: neutral.ActionToolCall, ToolName: name, ToolInput: input}, true
 }
 
-func (r *REPL) record(a neutral.Action) neutral.Action {
+// report tells the operator what actually happened to the action they authored
+// and appends it to the --record chain. An action the harness never received (it
+// disconnected or timed out while the operator was composing) is called out and
+// deliberately NOT recorded: a recorded step is a claim that the harness ran it,
+// and that claim would be false.
+func (r *REPL) report(a neutral.Action, delivered bool) {
+	if !delivered {
+		r.print(sErr.Render("! NOT DELIVERED: the harness stopped waiting for this reply before you sent it.") + "\n")
+		r.print(sSep.Render("  Nothing ran and nothing was recorded. Re-author it on the next request.") + "\n")
+		return
+	}
 	switch a.Kind {
 	case neutral.ActionToolCall:
 		r.print(sSend.Render(fmt.Sprintf("-> sent  %s %s", a.ToolName, string(a.ToolInput))) + "\n")
@@ -426,7 +493,6 @@ func (r *REPL) record(a neutral.Action) neutral.Action {
 			r.print(sErr.Render("! failed to record step: "+err.Error()) + "\n")
 		}
 	}
-	return a
 }
 
 func (r *REPL) help() {
@@ -549,4 +615,20 @@ func split2(s string) (string, string) {
 		return s[:i], strings.TrimSpace(s[i+1:])
 	}
 	return s, ""
+}
+
+// historyFile keeps command history in the user's config dir rather than the
+// per-run evidence directory. Under runs/<ts>/ every session started with an
+// empty history (the point of having it is recalling last run's commands), and
+// it left a non-evidence file in the folder handed to the client.
+func historyFile() string {
+	base, err := os.UserConfigDir()
+	if err != nil {
+		return "" // readline treats empty as "no history file"
+	}
+	dir := filepath.Join(base, "daiyaku")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "repl_history")
 }

@@ -5,10 +5,10 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 	"daiyaku/internal/engine"
 	"daiyaku/internal/neutral"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 func lipglossWidth(s string) int { return lipgloss.Width(s) }
@@ -34,11 +34,19 @@ func TestRenderRealistic(t *testing.T) {
 	// Every visible line must fit the width (no horizontal overflow).
 	over := 0
 	for _, l := range lines {
-		if lipglossWidth(l) > 120 { over++ }
+		if lipglossWidth(l) > 120 {
+			over++
+		}
 	}
 	t.Logf("total lines=%d width=120 height=40 overflow_lines=%d selected_tool=%s", len(lines), over, mm.selectedTool().Name)
 	t.Logf("\n%s", out)
-	if over > 0 { t.Errorf("%d lines exceed terminal width", over) }
-	if len(lines) > 40 { t.Errorf("view is %d lines, exceeds height 40 (would push header off-screen)", len(lines)) }
-	if mm.selectedTool().Name != "Bash" { t.Errorf("expected Bash auto-selected, got %s", mm.selectedTool().Name) }
+	if over > 0 {
+		t.Errorf("%d lines exceed terminal width", over)
+	}
+	if len(lines) > 40 {
+		t.Errorf("view is %d lines, exceeds height 40 (would push header off-screen)", len(lines))
+	}
+	if mm.selectedTool().Name != "Bash" {
+		t.Errorf("expected Bash auto-selected, got %s", mm.selectedTool().Name)
+	}
 }

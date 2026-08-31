@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"daiyaku/internal/neutral"
 )
@@ -68,21 +69,72 @@ func Load(path string) (*File, error) {
 		if err := json.Unmarshal(b, &steps); err != nil {
 			return nil, fmt.Errorf("parse sequence: %w", err)
 		}
-		return &File{Steps: steps}, nil
+		f := &File{Steps: steps}
+		if err := f.Validate(); err != nil {
+			return nil, err
+		}
+		return f, nil
 	}
 	var f File
 	if err := json.Unmarshal(b, &f); err != nil {
 		return nil, fmt.Errorf("parse sequence: %w", err)
 	}
+	if err := f.Validate(); err != nil {
+		return nil, err
+	}
 	return &f, nil
 }
 
+// Validate rejects steps that would silently misbehave at replay time: a step
+// with neither a tool nor text quietly ends the harness turn, and a tool input
+// that is not a JSON object cannot be serialized to either wire format. Both are
+// far cheaper to catch when the file is loaded than three steps into a run.
+func (f *File) Validate() error {
+	for i, s := range f.Steps {
+		if s.Tool == "" && s.Text == "" && !s.End {
+			return fmt.Errorf("step %d has neither \"tool\" nor \"text\" (note: %q)", i+1, s.Note)
+		}
+		if s.Tool != "" && s.Text != "" {
+			return fmt.Errorf("step %d sets both \"tool\" and \"text\"; use one per step", i+1)
+		}
+		if err := s.Action().Validate(); err != nil {
+			return fmt.Errorf("step %d: %w", i+1, err)
+		}
+	}
+	return nil
+}
+
+// Save writes via a temp file and a rename so an interrupted write cannot leave
+// a half-written (or empty) recording where a complete one used to be: the file
+// is rewritten in full after every recorded step.
 func Save(path string, f *File) error {
 	b, err := json.MarshalIndent(f, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, b, 0o644)
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".daiyaku-seq-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op once the rename succeeds
+	if _, err := tmp.Write(b); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	// Windows will not rename onto an existing file.
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 // If the file exists but cannot be parsed, AppendStep refuses rather than

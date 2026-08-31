@@ -45,20 +45,21 @@ type wireMessage struct {
 }
 
 type wireTool struct {
+	Type        string          `json:"type"` // absent or "custom" for a normal function; set for server tools
 	Name        string          `json:"name"`
 	Description string          `json:"description"`
 	InputSchema json.RawMessage `json:"input_schema"`
 }
 
 type wireBlock struct {
-	Type       string          `json:"type"`
-	Text       string          `json:"text"`
-	ID         string          `json:"id"`
-	Name       string          `json:"name"`
-	Input      json.RawMessage `json:"input"`
-	ToolUseID  string          `json:"tool_use_id"`
-	Content    json.RawMessage `json:"content"` // tool_result: string or []block
-	IsError    bool            `json:"is_error"`
+	Type      string          `json:"type"`
+	Text      string          `json:"text"`
+	ID        string          `json:"id"`
+	Name      string          `json:"name"`
+	Input     json.RawMessage `json:"input"`
+	ToolUseID string          `json:"tool_use_id"`
+	Content   json.RawMessage `json:"content"` // tool_result: string or []block
+	IsError   bool            `json:"is_error"`
 }
 
 func (a *Adapter) Normalize(_ http.Header, body []byte) (*neutral.Request, error) {
@@ -76,7 +77,7 @@ func (a *Adapter) Normalize(_ http.Header, body []byte) (*neutral.Request, error
 	for _, t := range wr.Tools {
 		req.Tools = append(req.Tools, neutral.ToolDef{
 			Name:        t.Name,
-			Kind:        "function",
+			Kind:        toolKind(t),
 			Description: t.Description,
 			Schema:      t.InputSchema,
 		})
@@ -198,4 +199,16 @@ func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 	w.Header().Set("content-type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(v)
+}
+
+// toolKind classifies an offered tool. Server-side tools (web_search, the text
+// editor, bash_20250124, ...) arrive with a versioned "type" and usually without
+// an input_schema; reporting them as ordinary functions understates the offered
+// surface, which is the thing an enumeration finding is about. "custom" is the
+// explicit spelling of a normal client tool, so it normalizes to "function".
+func toolKind(t wireTool) string {
+	if t.Type == "" || t.Type == "custom" || t.Type == "function" {
+		return "function"
+	}
+	return t.Type
 }

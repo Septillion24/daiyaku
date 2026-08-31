@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/textarea"
@@ -94,6 +95,7 @@ type model struct {
 	ready         bool
 
 	ex        *engine.Exchange
+	queue     []*engine.Exchange // requests that arrived while another was unanswered
 	prevTools []string
 
 	ctxView  viewport.Model
@@ -159,12 +161,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 
 	case exchangeMsg:
-		m.ex = msg.ex
-		m.tools = msg.ex.Req.Tools
-		m.toolIdx = pickDefaultTool(m.tools)
-		m.status = fmt.Sprintf("AWAITING OPERATOR · request #%d", msg.ex.Req.Seq)
-		m.statusStyle = lipgloss.NewStyle().Foreground(cGood).Bold(true)
-		m.refreshContext()
+		// A harness can have several calls in flight (subagents, side-channel
+		// calls). Queue them: overwriting the one on screen would leave its HTTP
+		// handler blocked until the harness timed out, with no sign anything was
+		// lost.
+		if m.ex != nil {
+			m.queue = append(m.queue, msg.ex)
+			m.status = fmt.Sprintf("AWAITING OPERATOR · request #%d%s", m.ex.Req.Seq, m.queueSuffix())
+			return m, nil
+		}
+		m.adopt(msg.ex)
 		return m, nil
 
 	case tea.KeyMsg:
@@ -188,12 +194,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) handleKey(msg tea.KeyMsg) (model, tea.Cmd, bool) {
-	switch msg.String() {
-	case "ctrl+c":
+	if msg.String() == "ctrl+c" {
 		return *m, tea.Quit, true
+	}
+	if cmd, ok := m.handleComposerKey(msg); ok {
+		return *m, cmd, true
+	}
+	if cmd, ok := m.handleNavKey(msg); ok {
+		return *m, cmd, true
+	}
+	if m.focus == focusTools {
+		if cmd, ok := m.handleToolsKey(msg); ok {
+			return *m, cmd, true
+		}
+	}
+	return *m, nil, false
+}
+
+// handleComposerKey handles send/compose keys, which act only while the composer
+// is the focus (enter/alt+enter) or regardless of focus (mode toggle, ctrl+s/e).
+func (m *model) handleComposerKey(msg tea.KeyMsg) (tea.Cmd, bool) {
+	switch msg.String() {
 	case "enter":
 		if m.focus == focusComposer {
-			return *m, m.send(false), true
+			return m.send(false), true
 		}
 	case "alt+enter":
 		// Alt+Enter adds a newline and grows the box. Shift+Enter can't be used:
@@ -201,19 +225,8 @@ func (m *model) handleKey(msg tea.KeyMsg) (model, tea.Cmd, bool) {
 		if m.focus == focusComposer {
 			m.composer.InsertString("\n")
 			m.resizeComposer()
-			return *m, nil, true
+			return nil, true
 		}
-	case "tab":
-		m.focus = (m.focus + 1) % 3
-		m.syncFocus()
-		return *m, nil, true
-	case "shift+tab":
-		m.focus = (m.focus + 2) % 3
-		m.syncFocus()
-		return *m, nil, true
-	case "ctrl+t":
-		m.loadTemplate()
-		return *m, nil, true
 	case "ctrl+g":
 		if m.compose == modeTool {
 			m.compose = modeText
@@ -222,48 +235,68 @@ func (m *model) handleKey(msg tea.KeyMsg) (model, tea.Cmd, bool) {
 			m.compose = modeTool
 			m.composer.Placeholder = "type a command"
 		}
-		return *m, nil, true
+		return nil, true
 	case "ctrl+s":
-		return *m, m.send(false), true
+		return m.send(false), true
 	case "ctrl+e":
-		return *m, m.send(true), true
+		return m.send(true), true
+	}
+	return nil, false
+}
+
+// handleNavKey handles focus, template, refresh, system-toggle and scroll keys.
+func (m *model) handleNavKey(msg tea.KeyMsg) (tea.Cmd, bool) {
+	switch msg.String() {
+	case "tab":
+		m.focus = (m.focus + 1) % 3
+		m.syncFocus()
+		return nil, true
+	case "shift+tab":
+		m.focus = (m.focus + 2) % 3
+		m.syncFocus()
+		return nil, true
+	case "ctrl+t":
+		m.loadTemplate()
+		return nil, true
 	case "ctrl+r":
 		m.refreshContext()
-		return *m, nil, true
+		return nil, true
 	case "s":
 		if m.focus != focusComposer {
 			m.showSystem = !m.showSystem
 			m.refreshContext()
-			return *m, nil, true
+			return nil, true
 		}
 	case "pgup":
 		m.ctxView.HalfViewUp()
-		return *m, nil, true
+		return nil, true
 	case "pgdown":
 		m.ctxView.HalfViewDown()
-		return *m, nil, true
+		return nil, true
 	}
+	return nil, false
+}
 
-	if m.focus == focusTools {
-		switch msg.String() {
-		case "up", "k":
-			if m.toolIdx > 0 {
-				m.toolIdx--
-			}
-			return *m, nil, true
-		case "down", "j":
-			if m.toolIdx < len(m.tools)-1 {
-				m.toolIdx++
-			}
-			return *m, nil, true
-		case "enter":
-			m.loadTemplate()
-			m.focus = focusComposer
-			m.syncFocus()
-			return *m, nil, true
+// handleToolsKey handles list navigation, active only while the tools pane is focused.
+func (m *model) handleToolsKey(msg tea.KeyMsg) (tea.Cmd, bool) {
+	switch msg.String() {
+	case "up", "k":
+		if m.toolIdx > 0 {
+			m.toolIdx--
 		}
+		return nil, true
+	case "down", "j":
+		if m.toolIdx < len(m.tools)-1 {
+			m.toolIdx++
+		}
+		return nil, true
+	case "enter":
+		m.loadTemplate()
+		m.focus = focusComposer
+		m.syncFocus()
+		return nil, true
 	}
-	return *m, nil, false
+	return nil, false
 }
 
 func (m *model) syncFocus() {
@@ -302,14 +335,18 @@ func (m *model) loadTemplate() {
 	}
 }
 
-func (m *model) send(end bool) tea.Cmd {
+// send delivers what the operator composed. asText forces the plain-words path
+// (Ctrl+E) whatever the composer mode is: without it the key that is documented
+// as "end the turn in words" would fall through to the tool path and execute the
+// operator's sentence as a shell command.
+func (m *model) send(asText bool) tea.Cmd {
 	if m.ex == nil {
 		m.flash(cWarn, "no pending request")
 		return nil
 	}
 	var action neutral.Action
 
-	if m.compose == modeText {
+	if m.compose == modeText || asText {
 		// A plain-words reply always ends the turn; only a tool call continues the loop.
 		action = neutral.Action{Kind: neutral.ActionEnd, Text: m.composer.Value()}
 	} else {
@@ -344,18 +381,57 @@ func (m *model) send(end bool) tea.Cmd {
 
 	ex := m.ex
 	m.prevTools = ex.Req.ToolNames()
-	ex.Respond(action)
-	m.record(action)
-	m.sent++
-	m.ex = nil
-	m.tools = nil
+	delivered := ex.Respond(action)
 	m.composer.Reset()
 	m.resizeComposer()
-	m.status = "waiting for the harness…"
-	m.statusStyle = stStatus
+	if !delivered {
+		// The harness disconnected or timed out while this was being composed.
+		// Nothing ran, so nothing is recorded: a recorded step claims the harness
+		// executed it, and that claim would be false.
+		m.dropCurrent()
+		m.flash(cErr, "NOT DELIVERED: harness stopped waiting. Nothing ran, nothing recorded.")
+		m.ctxView.SetContent(m.wrap(m.undeliveredSummary(action)))
+		m.ctxView.GotoTop()
+		return nil
+	}
+	m.record(action)
+	m.sent++
 	m.ctxView.SetContent(m.wrap(m.sentSummary(action)))
 	m.ctxView.GotoTop()
+	m.dropCurrent()
 	return nil
+}
+
+// dropCurrent releases the answered request and pulls up the next one the
+// harness has queued behind it, if any.
+func (m *model) dropCurrent() {
+	m.ex = nil
+	m.tools = nil
+	if len(m.queue) > 0 {
+		next := m.queue[0]
+		m.queue = m.queue[1:]
+		m.adopt(next)
+		return
+	}
+	m.status = "waiting for the harness…"
+	m.statusStyle = stStatus
+}
+
+// adopt puts an exchange on screen as the one awaiting an answer.
+func (m *model) adopt(ex *engine.Exchange) {
+	m.ex = ex
+	m.tools = ex.Req.Tools
+	m.toolIdx = pickDefaultTool(m.tools)
+	m.status = fmt.Sprintf("AWAITING OPERATOR · request #%d%s", ex.Req.Seq, m.queueSuffix())
+	m.statusStyle = lipgloss.NewStyle().Foreground(cGood).Bold(true)
+	m.refreshContext()
+}
+
+func (m *model) queueSuffix() string {
+	if len(m.queue) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" · %d more queued", len(m.queue))
 }
 
 func (m *model) record(a neutral.Action) {
@@ -384,6 +460,21 @@ func (m *model) sentSummary(a neutral.Action) string {
 	return b.String()
 }
 
+// undeliveredSummary explains a reply that never reached the harness, so the
+// pane does not read as if the action ran.
+func (m *model) undeliveredSummary(a neutral.Action) string {
+	var b strings.Builder
+	b.WriteString("! NOT DELIVERED\n\n")
+	b.WriteString("The harness stopped waiting for this reply (it disconnected or\ntimed out) before you sent it. Nothing ran, nothing was recorded.\n\n")
+	switch a.Kind {
+	case neutral.ActionToolCall:
+		fmt.Fprintf(&b, "discarded: %s %s\n", a.ToolName, string(a.ToolInput))
+	default:
+		fmt.Fprintf(&b, "discarded reply: %q\n", a.Text)
+	}
+	return b.String()
+}
+
 func (m *model) refreshContext() {
 	if m.ex == nil {
 		return
@@ -408,8 +499,20 @@ func (m *model) layout() {
 	}
 	m.tooSmall = false
 
-	// Grow from composerMinRows as lines are added, capped by composerMaxRows and
-	// by whatever height leaves the body pane at least one row.
+	m.layoutComposer()
+	m.bodyInner = m.height - m.composerRows - 9
+	if m.bodyInner < 1 {
+		m.bodyInner = 1
+	}
+	m.layoutPanes()
+	m.ctxView.Width = m.leftInner
+	m.ctxView.Height = m.bodyInner
+}
+
+// layoutComposer sizes the composer: it grows from composerMinRows as lines are
+// added, capped by composerMaxRows and by whatever height leaves the body pane
+// at least one row.
+func (m *model) layoutComposer() {
 	m.composer.SetWidth(m.width - 4)
 	maxRows := m.height - 10
 	if maxRows > composerMaxRows {
@@ -427,11 +530,11 @@ func (m *model) layout() {
 	}
 	m.composerRows = rows
 	m.composer.SetHeight(rows)
+}
 
-	m.bodyInner = m.height - m.composerRows - 9
-	if m.bodyInner < 1 {
-		m.bodyInner = 1
-	}
+// layoutPanes splits the width into the left context pane and right tools pane,
+// enforcing minimum widths for each.
+func (m *model) layoutPanes() {
 	leftBox := m.width * 6 / 10
 	if leftBox < 24 {
 		leftBox = 24
@@ -449,8 +552,6 @@ func (m *model) layout() {
 	if m.rightInner < 8 {
 		m.rightInner = 8
 	}
-	m.ctxView.Width = m.leftInner
-	m.ctxView.Height = m.bodyInner
 }
 
 func (m model) View() string {
@@ -481,7 +582,22 @@ func (m model) headerView() string {
 		rec = " · REC ●"
 	}
 	left := stHeader.Render(fmt.Sprintf("daiyaku · %s", m.t.provider))
-	rightPlain := fmt.Sprintf("model=%s  req=#%d  sent=%d%s  ·  Tab focus · Ctrl+G act/reply · Ctrl+C quit", model, seq, m.sent, rec)
+	queue := ""
+	if m.t.eng != nil {
+		// Requests queued behind the one on screen (which is itself in-flight while
+		// m.ex is set), and side-channel calls the engine graded automatically.
+		q := m.t.eng.Waiting()
+		if m.ex != nil && q > 0 {
+			q--
+		}
+		if q > 0 {
+			queue += fmt.Sprintf("  q=%d", q)
+		}
+		if a := m.t.eng.AutoAnswered(); a > 0 {
+			queue += fmt.Sprintf("  auto=%d", a)
+		}
+	}
+	rightPlain := fmt.Sprintf("model=%s  req=#%d  sent=%d%s%s  ·  Tab focus · Ctrl+G act/reply · Ctrl+C quit", model, seq, m.sent, queue, rec)
 	avail := m.width - lipgloss.Width(left) - 1
 	right := stMuted.Render(truncate(rightPlain, max(0, avail)))
 	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right)
@@ -541,38 +657,64 @@ func (m model) toolsPane() string {
 	if listRows < 1 {
 		listRows = 1
 	}
-	for i, t := range m.tools {
-		if i >= listRows {
-			fmt.Fprintf(&b, stMuted.Render("  … %d more (j/k)")+"\n", len(m.tools)-i)
-			break
-		}
-		label := t.Label()
-		suffix := ""
-		if t.Kind != "" && t.Kind != "function" {
-			suffix = " " + stMuted.Render("["+t.Kind+"]")
-		}
-		newMark := "  "
-		if len(m.prevTools) > 0 && !prev[label] {
-			newMark = lipgloss.NewStyle().Foreground(cGood).Render("+ ")
-		}
-		line := truncate(label, w-4)
-		if i == m.toolIdx {
-			cur := lipgloss.NewStyle().Foreground(cAccent).Bold(true).Render("▸ ")
-			line = lipgloss.NewStyle().Foreground(lipgloss.Color("231")).Bold(true).Render(line)
-			b.WriteString(cur + line + suffix + "\n")
-		} else {
-			b.WriteString(newMark + line + suffix + "\n")
+	visible := listRows
+	if len(m.tools) > listRows {
+		visible = listRows - 1 // one row pays for the scroll marker
+		if visible < 1 {
+			visible = 1
 		}
 	}
-	if t := m.selectedTool(); t != nil {
-		b.WriteString("\n" + stMuted.Render(strings.Repeat("─", max(4, w-2))) + "\n")
-		b.WriteString(stTitle.Render(truncate(t.Label(), w-2)) + "\n")
-		if f := primaryField(t.Schema); f != "" {
-			b.WriteString(stMuted.Render("bare text → \""+f+"\"") + "\n")
-		}
-		b.WriteString(wrapText(oneLine(t.Description), w-2))
+	first := m.toolListStart(visible)
+	last := first + visible
+	if last > len(m.tools) {
+		last = len(m.tools)
 	}
+	for i := first; i < last; i++ {
+		b.WriteString(m.toolRow(i, m.tools[i], prev, w))
+	}
+	if first > 0 || last < len(m.tools) {
+		b.WriteString(stMuted.Render(fmt.Sprintf("  %d above · %d below (j/k)",
+			first, len(m.tools)-last)) + "\n")
+	}
+	b.WriteString(m.toolDetail(w))
 	return fitBorder(b.String(), w, m.bodyInner+1, m.focus == focusTools)
+}
+
+// toolRow renders one row of the offered-tools list: a selection marker or a
+// "new this turn" marker, the (truncated) label, and any non-function kind tag.
+func (m model) toolRow(i int, t neutral.ToolDef, prev map[string]bool, w int) string {
+	label := t.Label()
+	suffix := ""
+	if t.Kind != "" && t.Kind != "function" {
+		suffix = " " + stMuted.Render("["+t.Kind+"]")
+	}
+	newMark := "  "
+	if len(m.prevTools) > 0 && !prev[label] {
+		newMark = lipgloss.NewStyle().Foreground(cGood).Render("+ ")
+	}
+	line := truncate(label, w-4)
+	if i == m.toolIdx {
+		cur := lipgloss.NewStyle().Foreground(cAccent).Bold(true).Render("▸ ")
+		line = lipgloss.NewStyle().Foreground(lipgloss.Color("231")).Bold(true).Render(line)
+		return cur + line + suffix + "\n"
+	}
+	return newMark + line + suffix + "\n"
+}
+
+// toolDetail renders the footer describing the currently selected tool, or "" if none.
+func (m model) toolDetail(w int) string {
+	t := m.selectedTool()
+	if t == nil {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("\n" + stMuted.Render(strings.Repeat("─", max(4, w-2))) + "\n")
+	b.WriteString(stTitle.Render(truncate(t.Label(), w-2)) + "\n")
+	if f := primaryField(t.Schema); f != "" {
+		b.WriteString(stMuted.Render("bare text → \""+f+"\"") + "\n")
+	}
+	b.WriteString(wrapText(oneLine(t.Description), w-2))
+	return b.String()
 }
 
 func (m model) composerPane() string {
@@ -628,32 +770,49 @@ func wrapText(s string, w int) string {
 	return strings.Join(out, "\n")
 }
 
+type propType struct {
+	Type string `json:"type"`
+}
+
 func primaryField(schema json.RawMessage) string {
 	var s struct {
-		Properties map[string]struct {
-			Type string `json:"type"`
-		} `json:"properties"`
-		Required []string `json:"required"`
+		Properties map[string]propType `json:"properties"`
+		Required   []string            `json:"required"`
 	}
 	if len(schema) == 0 || json.Unmarshal(schema, &s) != nil {
 		return ""
 	}
 	for _, r := range s.Required {
-		if p, ok := s.Properties[r]; ok && (p.Type == "string" || p.Type == "") {
+		if schemaTextField(s.Properties, r) {
 			return r
 		}
 	}
 	for _, n := range []string{"command", "cmd", "prompt", "query", "content", "path", "file_path", "url"} {
-		if p, ok := s.Properties[n]; ok && (p.Type == "string" || p.Type == "") {
+		if schemaTextField(s.Properties, n) {
 			return n
 		}
 	}
-	for n, p := range s.Properties {
-		if p.Type == "string" {
+	// Last resort: the first string property in sorted order. Ranging the map
+	// directly made the same tool map bare text into a different field on
+	// different turns, silently changing what got executed.
+	names := make([]string, 0, len(s.Properties))
+	for n := range s.Properties {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		if s.Properties[n].Type == "string" {
 			return n
 		}
 	}
 	return ""
+}
+
+// schemaTextField reports whether the named property exists and is a string
+// (or untyped, treated as a string) field the operator can fill with bare text.
+func schemaTextField(props map[string]propType, name string) bool {
+	p, ok := props[name]
+	return ok && (p.Type == "string" || p.Type == "")
 }
 
 func pickDefaultTool(tools []neutral.ToolDef) int {
@@ -667,4 +826,22 @@ func pickDefaultTool(tools []neutral.ToolDef) int {
 		}
 	}
 	return 0
+}
+
+// toolListStart picks the first row of the visible tool window so the selected
+// tool is always drawn. Without it, j past the bottom of the pane moved the
+// highlight into rows that were never rendered and the operator lost track of
+// what the composer was about to call.
+func (m model) toolListStart(visible int) int {
+	if visible < 1 || m.toolIdx < visible {
+		return 0
+	}
+	first := m.toolIdx - visible + 1
+	if maxFirst := len(m.tools) - visible; first > maxFirst {
+		first = maxFirst
+	}
+	if first < 0 {
+		first = 0
+	}
+	return first
 }

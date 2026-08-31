@@ -6,9 +6,29 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 
 	"daiyaku/internal/sequence"
 )
+
+// reportEntry is one line of a session transcript.
+type reportEntry struct {
+	Dir     string          `json:"dir"`
+	Kind    string          `json:"kind"`
+	Seq     int             `json:"seq"`
+	TS      string          `json:"ts"`
+	Payload json.RawMessage `json:"payload"`
+}
+
+// reportAgg accumulates the running totals and recovered steps while scanning a
+// transcript.
+type reportAgg struct {
+	steps                   []sequence.Step
+	reqs, executed, proxied int
+	notes                   map[string]int
+	noteLines               []string
+}
 
 func runReport(args []string) error {
 	fs := newFlagSet("report")
@@ -26,54 +46,18 @@ func runReport(args []string) error {
 	}
 	defer f.Close()
 
-	type entry struct {
-		Dir     string          `json:"dir"`
-		Kind    string          `json:"kind"`
-		Seq     int             `json:"seq"`
-		TS      string          `json:"ts"`
-		Payload json.RawMessage `json:"payload"`
-	}
-
-	var steps []sequence.Step
-	var reqs, executed, proxied int
+	var agg reportAgg
 	fmt.Printf("\ndaiyaku session report: %s\n", dir)
 	fmt.Println("────────────────────────────────────────────────────────")
 
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 1024*1024), 64*1024*1024)
 	for sc.Scan() {
-		var e entry
+		var e reportEntry
 		if json.Unmarshal(sc.Bytes(), &e) != nil {
 			continue
 		}
-		switch {
-		case e.Dir == "harness->mock" && e.Kind == "request":
-			reqs++
-		case e.Dir == "mock->harness":
-			var act struct {
-				Kind      string          `json:"kind"`
-				ToolName  string          `json:"tool_name"`
-				ToolInput json.RawMessage `json:"tool_input"`
-				Text      string          `json:"text"`
-				Proxied   bool            `json:"proxied"`
-				Status    int             `json:"status"`
-			}
-			json.Unmarshal(e.Payload, &act)
-			if act.Proxied {
-				proxied++
-				fmt.Printf("  #%-3d  [proxied] upstream status %d\n", e.Seq, act.Status)
-				continue
-			}
-			switch act.Kind {
-			case "tool_call":
-				executed++
-				fmt.Printf("  #%-3d  tool_call  %s %s\n", e.Seq, act.ToolName, string(act.ToolInput))
-				steps = append(steps, sequence.Step{Tool: act.ToolName, Input: act.ToolInput})
-			case "text", "end":
-				fmt.Printf("  #%-3d  %-9s %q\n", e.Seq, act.Kind, act.Text)
-				steps = append(steps, sequence.Step{Text: act.Text, End: act.Kind == "end"})
-			}
-		}
+		agg.handle(e)
 	}
 
 	if err := sc.Err(); err != nil {
@@ -81,24 +65,122 @@ func runReport(args []string) error {
 	}
 
 	fmt.Println("────────────────────────────────────────────────────────")
-	fmt.Printf("  requests seen : %d\n", reqs)
-	fmt.Printf("  tool calls    : %d\n", executed)
-	if proxied > 0 {
-		fmt.Printf("  proxied       : %d\n", proxied)
+	fmt.Printf("  requests seen : %d\n", agg.reqs)
+	fmt.Printf("  tool calls    : %d\n", agg.executed)
+	if agg.proxied > 0 {
+		fmt.Printf("  proxied       : %d\n", agg.proxied)
 	}
 
-	if len(steps) > 0 {
-		out := filepath.Join(dir, "reconstructed-sequence.json")
-		if err := sequence.Save(out, &sequence.File{
-			Name:        "reconstructed",
-			Description: "Operator actions recovered from " + path + "; replay with -mode canned.",
-			Steps:       steps,
-		}); err != nil {
-			return err
-		}
-		fmt.Printf("\n  replayable sequence written: %s\n", out)
-		fmt.Printf("  re-run with: daiyaku serve --mode canned --sequence %q\n", out)
+	agg.printNotes()
+
+	if err := writeReconstructed(dir, path, agg.steps); err != nil {
+		return err
 	}
 	fmt.Println()
 	return nil
+}
+
+// handle folds one transcript entry into the running totals.
+func (a *reportAgg) handle(e reportEntry) {
+	switch {
+	case e.Dir == "harness->mock" && e.Kind == "request":
+		a.reqs++
+	case e.Dir == "mock->harness":
+		a.handleAction(e)
+	case e.Dir == "note":
+		a.handleNote(e)
+	}
+}
+
+// handleNote keeps the out-of-band entries: unrouted paths are the harness
+// probing for features the mock does not serve (a finding in its own right), and
+// the error notes explain any gap between requests seen and actions sent.
+func (a *reportAgg) handleNote(e reportEntry) {
+	if e.Kind == "" || e.Kind == "session-start" {
+		return
+	}
+	if a.notes == nil {
+		a.notes = map[string]int{}
+	}
+	a.notes[e.Kind]++
+	if a.notes[e.Kind] <= 5 {
+		a.noteLines = append(a.noteLines, fmt.Sprintf("  note  %-16s %s", e.Kind, compactPayload(e.Payload)))
+	}
+}
+
+// compactPayload renders a note payload on one bounded line.
+func compactPayload(p json.RawMessage) string {
+	s := strings.Join(strings.Fields(string(p)), " ")
+	if len(s) > 160 {
+		s = s[:160] + "..."
+	}
+	return s
+}
+
+// handleAction records an operator action entry (a tool call, a text/end reply,
+// or a proxied upstream response), printing a report line for it.
+func (a *reportAgg) handleAction(e reportEntry) {
+	var act struct {
+		Kind      string          `json:"kind"`
+		ToolName  string          `json:"tool_name"`
+		ToolInput json.RawMessage `json:"tool_input"`
+		Text      string          `json:"text"`
+		Proxied   bool            `json:"proxied"`
+		Status    int             `json:"status"`
+	}
+	json.Unmarshal(e.Payload, &act)
+	if act.Proxied {
+		a.proxied++
+		fmt.Printf("  #%-3d  [proxied] upstream status %d\n", e.Seq, act.Status)
+		return
+	}
+	switch act.Kind {
+	case "tool_call":
+		a.executed++
+		fmt.Printf("  #%-3d  tool_call  %s %s\n", e.Seq, act.ToolName, string(act.ToolInput))
+		a.steps = append(a.steps, sequence.Step{Tool: act.ToolName, Input: act.ToolInput})
+	case "text", "end":
+		fmt.Printf("  #%-3d  %-9s %q\n", e.Seq, act.Kind, act.Text)
+		a.steps = append(a.steps, sequence.Step{Text: act.Text, End: act.Kind == "end"})
+	}
+}
+
+// writeReconstructed emits a replayable sequence file from the recovered steps,
+// or does nothing when no operator actions were found.
+func writeReconstructed(dir, path string, steps []sequence.Step) error {
+	if len(steps) == 0 {
+		return nil
+	}
+	out := filepath.Join(dir, "reconstructed-sequence.json")
+	if err := sequence.Save(out, &sequence.File{
+		Name:        "reconstructed",
+		Description: "Operator actions recovered from " + path + "; replay with -mode canned.",
+		Steps:       steps,
+	}); err != nil {
+		return err
+	}
+	fmt.Printf("\n  replayable sequence written: %s\n", out)
+	fmt.Printf("  re-run with: daiyaku serve --mode canned --sequence %q\n", out)
+	return nil
+}
+
+// printNotes reports the transcript's out-of-band entries. They are evidence:
+// an unrouted path is the harness probing for an endpoint the mock does not
+// serve, and an error note is a turn the operator may believe went through.
+func (a *reportAgg) printNotes() {
+	if len(a.notes) == 0 {
+		return
+	}
+	kinds := make([]string, 0, len(a.notes))
+	for k := range a.notes {
+		kinds = append(kinds, k)
+	}
+	sort.Strings(kinds)
+	fmt.Println()
+	for _, k := range kinds {
+		fmt.Printf("  %-16s : %d\n", k, a.notes[k])
+	}
+	for _, line := range a.noteLines {
+		fmt.Println(line)
+	}
 }

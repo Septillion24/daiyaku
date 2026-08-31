@@ -4,7 +4,13 @@
 // codebase needs to know which provider is in play.
 package neutral
 
-import "encoding/json"
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+)
 
 type BlockType string
 
@@ -113,4 +119,60 @@ func (r *Request) LastResult() *ToolResult {
 		}
 	}
 	return nil
+}
+
+// classifierSentinel is the opening line of Claude Code's auto-approval safety
+// classifier system prompt. It is a side-channel call the harness fires to grade
+// a pending tool action (it replies with "<severity>N</severity>" only), not a
+// turn in the agent conversation. The string is stable across cc versions.
+const classifierSentinel = "You are a security monitor for autonomous AI coding agents"
+
+// IsSafetyClassifier reports whether req is the harness's auto-approval safety
+// classifier side-call rather than a real agent turn. The classifier never
+// offers tools and always carries the sentinel system prompt, so a normal turn
+// (which always offers tools) cannot be mistaken for one. Such calls expect a
+// terse graded reply on a tight deadline; left for a human operator they stall
+// and the harness reports the model as unavailable, so daiyaku answers them
+// automatically (see engine.Engine.Auto).
+func (r *Request) IsSafetyClassifier() bool {
+	if len(r.Tools) > 0 {
+		return false
+	}
+	return strings.Contains(r.System, classifierSentinel)
+}
+
+// Validate reports whether the action can be serialized to a provider's wire
+// format at all. Both wire formats require a tool call's input to be a JSON
+// object (Anthropic sends it inline, OpenAI as a JSON-encoded string), so an
+// operator typo or a hand-written sequence file carrying a fragment, a bare
+// string, or an array would otherwise be emitted verbatim: the blocking encoder
+// fails after the 200 header is already out, and the streaming path ships the
+// broken fragment as partial_json. Both leave the harness with an unexplainable
+// parse error, so the mock refuses the action instead.
+func (a Action) Validate() error {
+	if a.Kind != ActionToolCall {
+		return nil
+	}
+	if a.ToolName == "" {
+		return errors.New("tool call has no tool name")
+	}
+	if len(a.ToolInput) == 0 {
+		return nil // adapters substitute {}
+	}
+	if !json.Valid(a.ToolInput) {
+		return fmt.Errorf("tool input for %s is not valid JSON: %s", a.ToolName, truncateForError(a.ToolInput))
+	}
+	trimmed := bytes.TrimSpace(a.ToolInput)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return fmt.Errorf("tool input for %s must be a JSON object, got %s", a.ToolName, truncateForError(a.ToolInput))
+	}
+	return nil
+}
+
+func truncateForError(b []byte) string {
+	const n = 120
+	if len(b) <= n {
+		return string(b)
+	}
+	return string(b[:n]) + "..."
 }

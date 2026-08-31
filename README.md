@@ -47,9 +47,9 @@ daiyaku -p openai -a 8790    # -a takes a bare port, :port, or host:port
 ```
 
 The `codex` and `claude` profiles preset the provider and its port (8787
-anthropic, 8790 openai, so both can run at once). Flags override profiles; env
-vars (`DAIYAKU_PROVIDER`, `DAIYAKU_ADDR`, `DAIYAKU_MODE`) override the built-in
-defaults. Precedence is flag > env > default. `daiyaku -h` for everything.
+anthropic, 8790 openai, so both can run at once). Precedence is
+**flag > env > profile > built-in default**, so a `DAIYAKU_ADDR` you exported for
+the session still wins over the profile's port. `daiyaku -h` for everything.
 
 ## Quickstart (Claude Code)
 
@@ -100,7 +100,8 @@ HARNESS_TEST_KEY=x codex exec \
 | `Enter` | send (`Alt+Enter` for a newline; the box grows past two lines) |
 | `Ctrl+T` | load the selected tool's input template (JSON for multi-field calls) |
 | `Ctrl+G` | toggle compose mode: tool call ↔ assistant text |
-| `Ctrl+E` | send as assistant text and end the turn |
+| `Ctrl+E` | send as assistant text and end the turn (whatever the compose mode) |
+| `Ctrl+R` | redraw the conversation pane |
 | `Tab` / `Shift+Tab` | move focus: composer → tools → context |
 | `j`/`k` (tools focused) | change selection; `Enter` loads its template |
 | `s` (context/tools focused) | show/hide the system prompt (hidden by default) |
@@ -165,6 +166,10 @@ against Phase-1 enumeration before running elsewhere.
 Every run writes `runs/<timestamp>/transcript.jsonl`: the full request/response
 record both directions, sensitive headers redacted to `<redacted:present>`. This
 is your primary evidence.
+
+The transcript is owner-only (0600) because it holds whatever the agent read:
+the full system prompt, file contents, and any secret it surfaced. Treat the run
+directory as client data.
 
 ```bash
 daiyaku report runs/20260830-150405

@@ -134,6 +134,16 @@ func (s *Server) handlePrimary(w http.ResponseWriter, r *http.Request) {
 	}
 	s.tx.Outbound(req.Seq, action)
 
+	// A malformed action (typo in the composer, hand-written sequence file) must
+	// not reach the wire: the blocking encoder would fail after the 200 header is
+	// already sent, and the streaming path would ship the fragment verbatim. Fail
+	// the request visibly instead, so the harness reports a real error.
+	if err := action.Validate(); err != nil {
+		s.tx.Note("invalid-action", map[string]string{"error": err.Error(), "seq": fmt.Sprint(req.Seq)})
+		writeWireError(w, err.Error())
+		return
+	}
+
 	if err := s.adapter.WriteResponse(w, req, action); err != nil {
 		s.tx.Note("write-error", map[string]string{"error": err.Error()})
 	}
@@ -166,4 +176,19 @@ func decodeForLog(body []byte) interface{} {
 		return v
 	}
 	return string(body)
+}
+
+// writeWireError reports a mock-side failure to the harness in a shape both
+// client SDKs surface to the user. Anthropic's envelope nests the message under
+// "error", which is also where the OpenAI SDKs look, so one body serves both.
+func writeWireError(w http.ResponseWriter, msg string) {
+	w.Header().Set("content-type", "application/json")
+	w.WriteHeader(http.StatusBadRequest)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"type": "error",
+		"error": map[string]string{
+			"type":    "invalid_request_error",
+			"message": "daiyaku: " + msg,
+		},
+	})
 }

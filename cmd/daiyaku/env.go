@@ -17,7 +17,12 @@ func runEnv(args []string) {
 	if err := fs.Parse(args); err != nil {
 		os.Exit(2)
 	}
-	addr = normalizeAddr(addr)
+	norm, err := normalizeAddr(addr)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	addr = norm
 	switch provider {
 	case "anthropic":
 		envAnthropic(addr)
