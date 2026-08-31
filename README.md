@@ -45,8 +45,8 @@ daiyaku -p openai -a 8790    # -a takes a bare port, :port, or host:port
 ```
 
 The `claude` and `codex` profiles preset the provider and its port, so both can
-run at once. Precedence is **flag > env > profile > default**. `daiyaku -h` for
-everything.
+run at once. Precedence is **flag > env > profile > default**. `daiyaku -h` lists
+the commands; `daiyaku serve -h` lists every serve flag.
 
 ## Quickstart (Claude Code)
 
@@ -145,15 +145,18 @@ Claude Code uses, does not.
 | `Enter` | send (`Alt+Enter` for a newline) |
 | `Ctrl+T` | load the selected tool's input template |
 | `Ctrl+G` | toggle compose mode: tool call or assistant text |
+| `Ctrl+S` | send from any focus (`Enter` only sends from the composer) |
 | `Ctrl+E` | send as assistant text and end the turn |
-| `Ctrl+R` | redraw the conversation pane |
+| `Ctrl+R` | re-render the conversation pane |
 | `Tab` / `Shift+Tab` | move focus: composer, tools, context |
 | `j`/`k` (tools focused) | change selection; `Enter` loads its template |
-| `s` | show/hide the system prompt (hidden by default) |
-| `PgUp`/`PgDn`, arrows, wheel | scroll the conversation |
+| `s` (focus off the composer) | show/hide the system prompt (hidden by default) |
+| `PgUp`/`PgDn` and the wheel | scroll the conversation from any focus |
+| arrows (context focused) | scroll the conversation |
 | `Ctrl+C` | quit |
 
-The tools pane marks tools added (`+`) or removed since the last turn. The gap
+The tools pane marks each tool that is new since the last turn with `+`, and
+names any that are no longer offered on a `- gone:` line below the list. The gap
 between what the harness offered and what you expected is itself a finding.
 
 ### REPL (default)
@@ -181,7 +184,7 @@ state without leaving.
 | **Canned** | `-m canned --sequence f.json` | replay a sequence, then hand the tail to an operator (`-fallback=false` to stop instead, for unattended re-tests) |
 | **Passthrough** | `-m passthrough --upstream https://api.anthropic.com` | proxy the real harness/API traffic and log wire shapes; the methodology's Step-0 capture |
 
-`--record chain.json` (TUI and REPL) saves everything you author into a
+`--record chain.json` (TUI, REPL, and canned) saves everything you author into a
 replayable file. Ship it with the report so the client can re-run each finding
 after remediation.
 
@@ -199,8 +202,8 @@ Ordered operator actions in JSON:
 
 A `text` step ends the harness's turn, so put it last. Starters for each
 methodology phase are in [`sequences/`](sequences/) (permission-boundary,
-blast-radius, egress). Tool names assume Claude Code; verify against Phase-1
-enumeration before running elsewhere.
+blast-radius, egress, plus a Codex recon starter). Tool names assume Claude Code;
+verify against Phase-1 enumeration before running elsewhere.
 
 ## The harness safety classifier
 
@@ -263,8 +266,10 @@ alongside the results.
 ## Adding a provider
 
 Everything provider-specific lives in one adapter under
-[`internal/adapter/`](internal/adapter/). Implement `Normalize(headers, body) ->
-neutral.Request` and `WriteResponse(w, req, action)`, register in `init()`, done.
+[`internal/adapter/`](internal/adapter/). Implement the four-method `Adapter`
+interface: `Provider()`, `Normalize(headers, body) -> neutral.Request`,
+`WriteResponse(w, req, action)`, and `Routes()` (the primary endpoint plus any
+aux endpoints that bypass the operator loop). Register it in `init()`, done.
 
 ## Limitations
 
