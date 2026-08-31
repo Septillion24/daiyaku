@@ -36,12 +36,15 @@ func TestLoadBareArrayAndWrapped(t *testing.T) {
 	}
 
 	wrapped := filepath.Join(dir, "w.json")
-	if err := Save(wrapped, &File{Name: "x", Steps: []Step{{Text: "hi", End: true}}}); err != nil {
+	if err := Save(wrapped, &File{Name: "x", Steps: []Step{{Text: "hi"}}}); err != nil {
 		t.Fatal(err)
 	}
 	f2, err := Load(wrapped)
-	if err != nil || f2.Name != "x" || !f2.Steps[0].End {
+	if err != nil || f2.Name != "x" || f2.Steps[0].Text != "hi" {
 		t.Fatalf("wrapped load: %v %+v", err, f2)
+	}
+	if got := f2.Steps[0].Action().Kind; got != neutral.ActionEnd {
+		t.Errorf("a text step produced %q, want an end-turn action", got)
 	}
 }
 

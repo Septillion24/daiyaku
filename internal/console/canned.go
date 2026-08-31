@@ -11,7 +11,14 @@ import (
 	"daiyaku/internal/sequence"
 )
 
-// Canned replays a fixed sequence of operator actions, then hands off to Fallback (or ends turns if nil).
+// sequenceCompleteMarker is the assistant text an unattended replay ends on, so
+// the marker shows up in the harness's own transcript and in the SOC timeline as
+// the agreed end of the test window.
+const sequenceCompleteMarker = "DAIYAKU: sequence complete."
+
+// Canned replays a fixed sequence of operator actions. With Fallback set the
+// operator takes over once the sequence runs out; without it the run ends the
+// harness turn and stops, so an unattended replay finishes on its own.
 type Canned struct {
 	Engine     *engine.Engine
 	Provider   string
@@ -57,9 +64,12 @@ func (c *Canned) Run(ctx context.Context) error {
 			}
 			continue
 		}
-		fmt.Printf("── sequence exhausted at request #%d; ending turn ──\n", ex.Req.Seq)
-		ex.Respond(neutral.Action{Kind: neutral.ActionEnd, Text: ""})
-		c.prevTools = ex.Req.ToolNames()
+		// Unattended replay (-fallback=false): end the harness turn cleanly with
+		// a marker it can print, then stop. Idling here answering empty end-turns
+		// forever meant an unattended run never finished by itself.
+		fmt.Printf("── sequence exhausted at request #%d; ending the turn and stopping ──\n", ex.Req.Seq)
+		ex.Respond(neutral.Action{Kind: neutral.ActionEnd, Text: sequenceCompleteMarker})
+		return nil
 	}
 }
 
@@ -72,6 +82,11 @@ func (c *Canned) replayStep(ctx context.Context, ex *engine.Exchange) bool {
 	fmt.Printf("── request #%d ─ %s\n", ex.Req.Seq, Summarize(ex.Req))
 	if step.Note != "" {
 		fmt.Printf("   note: %s\n", step.Note)
+	}
+	if w := SideCallWarning(ex.Req); w != "" {
+		// Worse here than interactively: an unrecognized side-call silently burns a
+		// sequence step, answering the harness's classifier with a shell command.
+		fmt.Printf("   ! %s\n", w)
 	}
 	c.warnUnoffered(ex.Req, action)
 	c.echo(c.idx, action)

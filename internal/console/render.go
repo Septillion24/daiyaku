@@ -290,3 +290,23 @@ func prettyJSON(raw json.RawMessage) string {
 	b, _ := json.MarshalIndent(v, "", "  ")
 	return string(b)
 }
+
+// SideCallWarning describes a request that reached the operator offering no
+// tools at all. A real agent turn always offers tools, so this is either a
+// harness side-channel call daiyaku failed to recognize (the classifier's shape
+// drifts every release) or an unusual turn worth a second look. Saying so is the
+// difference between a visible warning and a harness that mysteriously reports
+// the model as unavailable while a human types.
+func SideCallWarning(req *neutral.Request) string {
+	if len(req.Tools) > 0 {
+		return ""
+	}
+	if req.MayBeSideCall() {
+		return "this carries some marks of a harness side-channel call but not enough to answer it " +
+			"automatically: its shape has probably drifted. Such calls expect a terse reply on a short " +
+			"deadline, so answering by hand may make the harness report the model as unavailable. " +
+			"Check 'raw', then see -classifier-severity."
+	}
+	return "this request offers no tools. If it is a harness side-channel call rather than a turn, " +
+		"daiyaku did not recognize it and the harness may be waiting on a deadline. Check 'raw'."
+}

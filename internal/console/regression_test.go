@@ -190,3 +190,61 @@ func TestRecordedChainReloads(t *testing.T) {
 		t.Errorf("steps = %d, want 2", len(f.Steps))
 	}
 }
+
+// With no interactive fallback, an exhausted sequence must end the harness turn
+// and stop, so an unattended re-test run finishes on its own instead of idling.
+func TestUnattendedReplayEndsTheRun(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	eng := engine.New(2)
+	c := NewCanned(eng, "anthropic", &sequence.File{Steps: []sequence.Step{
+		{Tool: "Bash", Input: json.RawMessage(`{"command":"id"}`)},
+	}}, 0, "", nil)
+
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx) }()
+
+	first, err := eng.Submit(ctx, bashReq(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Kind != neutral.ActionToolCall {
+		t.Fatalf("first action = %+v, want the sequence's tool call", first)
+	}
+	second, err := eng.Submit(ctx, bashReq(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Kind != neutral.ActionEnd || second.Text == "" {
+		t.Errorf("exhausted sequence answered %+v, want an end-turn carrying a marker", second)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("run returned %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("unattended replay did not stop after the sequence ran out")
+	}
+}
+
+// A tool-less request means the classifier match may have drifted. The operator
+// has to be told, or the only symptom is a harness that reports the model as
+// unavailable while they type.
+func TestSideCallWarning(t *testing.T) {
+	withTools := &neutral.Request{Tools: []neutral.ToolDef{{Name: "Bash"}}}
+	if got := SideCallWarning(withTools); got != "" {
+		t.Errorf("a normal turn warned: %q", got)
+	}
+	plain := &neutral.Request{System: "Summarize this.", MaxTokens: 32000}
+	if got := SideCallWarning(plain); got == "" {
+		t.Error("a tool-less request produced no warning")
+	}
+	drifted := &neutral.Request{System: "Reworded guardrail prompt.", MaxTokens: 64}
+	if got := SideCallWarning(drifted); !strings.Contains(got, "drifted") {
+		t.Errorf("a near-miss side-call warned generically: %q", got)
+	}
+	if drifted.IsSafetyClassifier() {
+		t.Error("a single mark was enough to auto-answer; two are required")
+	}
+}

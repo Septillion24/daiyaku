@@ -424,6 +424,9 @@ func (m *model) adopt(ex *engine.Exchange) {
 	m.toolIdx = pickDefaultTool(m.tools)
 	m.status = fmt.Sprintf("AWAITING OPERATOR · request #%d%s", ex.Req.Seq, m.queueSuffix())
 	m.statusStyle = lipgloss.NewStyle().Foreground(cGood).Bold(true)
+	if w := SideCallWarning(ex.Req); w != "" {
+		m.flash(cWarn, "no tools offered: "+w)
+	}
 	m.refreshContext()
 }
 

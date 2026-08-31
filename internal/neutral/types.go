@@ -65,23 +65,27 @@ func (t ToolDef) Label() string {
 }
 
 type Request struct {
-	Provider  string            `json:"provider"`
-	Model     string            `json:"model"`
-	System    string            `json:"system,omitempty"`
-	Turns     []Turn            `json:"turns"`
-	Tools     []ToolDef         `json:"tools"`
-	Stream    bool              `json:"stream"`
-	MaxTokens int               `json:"max_tokens,omitempty"`
-	Seq       int               `json:"seq"`
-	Headers   map[string]string `json:"headers"` // selected subset, kept for evidence
-	Raw       []byte            `json:"-"`
+	Provider  string    `json:"provider"`
+	Model     string    `json:"model"`
+	System    string    `json:"system,omitempty"`
+	Turns     []Turn    `json:"turns"`
+	Tools     []ToolDef `json:"tools"`
+	Stream    bool      `json:"stream"`
+	MaxTokens int       `json:"max_tokens,omitempty"`
+	// StopSequences is part of how a harness side-call identifies itself; see
+	// IsSafetyClassifier.
+	StopSequences []string          `json:"stop_sequences,omitempty"`
+	Seq           int               `json:"seq"`
+	Headers       map[string]string `json:"headers"` // selected subset, kept for evidence
+	Raw           []byte            `json:"-"`
 }
 
 type ActionKind string
 
+// There is no "speak and continue" action: neither wire format lets an assistant
+// message keep the turn open, so any words the operator sends end it.
 const (
 	ActionToolCall ActionKind = "tool_call"
-	ActionText     ActionKind = "text"
 	ActionEnd      ActionKind = "end" // assistant text with end_turn stop reason
 )
 
@@ -121,24 +125,58 @@ func (r *Request) LastResult() *ToolResult {
 	return nil
 }
 
-// classifierSentinel is the opening line of Claude Code's auto-approval safety
-// classifier system prompt. It is a side-channel call the harness fires to grade
-// a pending tool action (it replies with "<severity>N</severity>" only), not a
-// turn in the agent conversation. The string is stable across cc versions.
-const classifierSentinel = "You are a security monitor for autonomous AI coding agents"
+// The harness fires side-channel calls that are not turns in the agent
+// conversation: Claude Code's auto-approval safety classifier grades a pending
+// tool action and expects "<severity>N</severity>" back on a tight deadline.
+// Left for a human operator it stalls, and the harness reports the model as
+// unavailable, so daiyaku answers it automatically (see engine.Engine.Auto).
+//
+// Recognition deliberately does not hang on one sentence of prose. That prose is
+// rewritten every harness release, and when the match silently stops the call
+// lands in the operator's queue and the harness wedges, with nothing to say why.
+// Three independent marks are each sufficient on their own, so the call is still
+// recognized when any one of them survives a rewrite. severityTag and
+// severityStopSequence are protocol rather than wording: the harness parses its
+// own reply for them, so changing them would break its own parser.
+const (
+	classifierSentinel   = "You are a security monitor for autonomous AI coding agents"
+	severityTag          = "<severity>"
+	severityStopSequence = "</severity>"
+	// A budget this small cannot hold a turn's worth of assistant output, so it
+	// marks a side-call. On its own it means little (any short call qualifies),
+	// so it only ever raises the operator's warning, never auto-answers.
+	sideCallMaxTokens = 256 // the classifier is observed at 64; the grade is one digit
+)
 
-// IsSafetyClassifier reports whether req is the harness's auto-approval safety
-// classifier side-call rather than a real agent turn. The classifier never
-// offers tools and always carries the sentinel system prompt, so a normal turn
-// (which always offers tools) cannot be mistaken for one. Such calls expect a
-// terse graded reply on a tight deadline; left for a human operator they stall
-// and the harness reports the model as unavailable, so daiyaku answers them
-// automatically (see engine.Engine.Auto).
+// IsSafetyClassifier reports whether req is a harness side-call to answer
+// automatically rather than a turn to put in front of the operator. Offering no
+// tools at all is required: a real agent turn always offers tools, so that gate
+// alone excludes the conversation and the marks below only have to tell one kind
+// of side-call from another.
 func (r *Request) IsSafetyClassifier() bool {
-	if len(r.Tools) > 0 {
-		return false
+	return len(r.Tools) == 0 && r.hasClassifierMark()
+}
+
+// hasClassifierMark reports any of the self-sufficient marks. Each is specific
+// enough that a genuine turn will not carry it by accident, so any single
+// survivor keeps the harness moving after a wording change.
+func (r *Request) hasClassifierMark() bool {
+	for _, s := range r.StopSequences {
+		if strings.Contains(s, severityStopSequence) {
+			return true
+		}
 	}
-	return strings.Contains(r.System, classifierSentinel)
+	return strings.Contains(r.System, severityTag) ||
+		strings.Contains(r.System, classifierSentinel)
+}
+
+// MayBeSideCall reports a tool-less request that looks like a side-call by
+// budget alone: too weak a signal to answer automatically, but enough that the
+// operator should be told the shape may have drifted. Without this, a match that
+// stops working shows up only as a harness that mysteriously stalls.
+func (r *Request) MayBeSideCall() bool {
+	return len(r.Tools) == 0 && !r.hasClassifierMark() &&
+		r.MaxTokens > 0 && r.MaxTokens <= sideCallMaxTokens
 }
 
 // Validate reports whether the action can be serialized to a provider's wire

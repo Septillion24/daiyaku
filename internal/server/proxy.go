@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"net/textproto"
 	"time"
-	"unicode/utf8"
 )
 
 // hopByHop headers are connection-scoped and must not be forwarded by a proxy (RFC 7230 §6.1).
@@ -48,8 +47,8 @@ func (p *Proxy) Forward(w http.ResponseWriter, r *http.Request, body []byte, tx 
 		return
 	}
 	// Dropping Accept-Encoding lets Go's transport request gzip and transparently
-	// decompress, so body_sample is readable text; the tradeoff is the recorded
-	// exchange is the decoded form, not the compressed wire.
+	// decompress, so the recorded body is readable text; the tradeoff is the
+	// recorded exchange is the decoded form, not the compressed wire.
 	copyRequestHeaders(up, r)
 
 	resp, err := p.client.Do(up)
@@ -65,13 +64,13 @@ func (p *Proxy) Forward(w http.ResponseWriter, r *http.Request, body []byte, tx 
 	copyResponseHeaders(w, resp)
 	w.WriteHeader(resp.StatusCode)
 
-	bodyLen, sample := streamBody(w, resp, tx)
+	bodyLen, wire := streamBody(w, resp, tx)
 	tx.Outbound(seq, map[string]interface{}{
-		"proxied":     true,
-		"status":      resp.StatusCode,
-		"upstream":    target,
-		"body_len":    bodyLen,
-		"body_sample": sample,
+		"proxied":  true,
+		"status":   resp.StatusCode,
+		"upstream": target,
+		"body_len": bodyLen,
+		"body":     wire,
 	})
 }
 
@@ -100,7 +99,9 @@ func copyResponseHeaders(w http.ResponseWriter, resp *http.Response) {
 }
 
 // streamBody re-streams the upstream body to the client while capturing it,
-// returning the captured length and a bounded sample for the transcript.
+// returning the captured length and the body itself. Step-0 capture exists to
+// evidence the exact wire shape, so the whole body is kept; it is already held
+// in memory to be re-streamed, so this costs nothing extra.
 func streamBody(w http.ResponseWriter, resp *http.Response, tx *Transcript) (int, string) {
 	var captured bytes.Buffer
 	flusher, _ := w.(http.Flusher)
@@ -122,18 +123,5 @@ func streamBody(w http.ResponseWriter, resp *http.Response, tx *Transcript) (int
 			break
 		}
 	}
-	return captured.Len(), firstN(captured.String(), 8000)
-}
-
-// firstN bounds the recorded sample without cutting a rune in half, which would
-// put invalid UTF-8 (rendered as replacement characters) into the transcript.
-func firstN(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	cut := n
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut--
-	}
-	return s[:cut]
+	return captured.Len(), captured.String()
 }

@@ -5,6 +5,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -144,9 +145,11 @@ func (s *Server) handlePrimary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.adapter.WriteResponse(w, req, action); err != nil {
+	rec := &wireRecorder{ResponseWriter: w, status: http.StatusOK}
+	if err := s.adapter.WriteResponse(rec, req, action); err != nil {
 		s.tx.Note("write-error", map[string]string{"error": err.Error()})
 	}
+	s.tx.Wire(req.Seq, rec.status, headerSnapshot(rec.Header()), rec.buf.String())
 }
 
 // sensitive headers are recorded as "<redacted:present>": evidence shows auth
@@ -191,4 +194,40 @@ func writeWireError(w http.ResponseWriter, msg string) {
 			"message": "daiyaku: " + msg,
 		},
 	})
+}
+
+// wireRecorder tees the response to the transcript as it is written, so the
+// evidence holds the exact bytes the harness received rather than a summary of
+// what the operator authored. Flush is reimplemented because SSE streaming
+// depends on the type assertion to http.Flusher succeeding through the wrapper.
+type wireRecorder struct {
+	http.ResponseWriter
+	buf    bytes.Buffer
+	status int
+}
+
+func (wr *wireRecorder) WriteHeader(code int) {
+	wr.status = code
+	wr.ResponseWriter.WriteHeader(code)
+}
+
+func (wr *wireRecorder) Write(p []byte) (int, error) {
+	wr.buf.Write(p)
+	return wr.ResponseWriter.Write(p)
+}
+
+func (wr *wireRecorder) Flush() {
+	if f, ok := wr.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// headerSnapshot copies the response headers as they stood when the body was
+// written. Values here are ours, so nothing needs redacting.
+func headerSnapshot(h http.Header) map[string]string {
+	out := make(map[string]string, len(h))
+	for k, v := range h {
+		out[strings.ToLower(k)] = strings.Join(v, ", ")
+	}
+	return out
 }

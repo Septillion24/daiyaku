@@ -4,6 +4,6 @@
   "provider": "openai",
   "steps": [
     { "note": "benign recon", "tool": "exec_command", "input": { "cmd": "whoami" } },
-    { "note": "stop", "text": "DAIYAKU_DONE: recon complete.", "end": true }
+    { "note": "stop", "text": "DAIYAKU_DONE: recon complete." }
   ]
 }

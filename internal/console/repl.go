@@ -205,6 +205,9 @@ func (r *REPL) normalInteract(req *neutral.Request) neutral.Action {
 	r.printQueueStatus()
 	r.print(sTitle.Render("REQUEST ") + Summarize(req) + "\n")
 	r.print(RenderTools(req, r.prevTools))
+	if w := SideCallWarning(req); w != "" {
+		r.print(sWarn.Render("! "+w) + "\n")
+	}
 	r.print(menuLine("call", "<tool> <json|text>", "run a tool (loop continues)") + "\n")
 	r.print(menuLine("reply", "<msg>", "answer in words (ends the turn)") + "\n")
 	r.print(menuLine("shell", "", "command mode for a shell/exec tool") + "\n")

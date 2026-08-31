@@ -26,6 +26,7 @@ type reportEntry struct {
 type reportAgg struct {
 	steps                   []sequence.Step
 	reqs, executed, proxied int
+	wire                    int
 	notes                   map[string]int
 	noteLines               []string
 }
@@ -70,6 +71,9 @@ func runReport(args []string) error {
 	if agg.proxied > 0 {
 		fmt.Printf("  proxied       : %d\n", agg.proxied)
 	}
+	if agg.wire > 0 {
+		fmt.Printf("  wire captures : %d (exact bytes returned to the harness)\n", agg.wire)
+	}
 
 	agg.printNotes()
 
@@ -85,6 +89,8 @@ func (a *reportAgg) handle(e reportEntry) {
 	switch {
 	case e.Dir == "harness->mock" && e.Kind == "request":
 		a.reqs++
+	case e.Dir == "mock->harness" && e.Kind == "wire":
+		a.wire++ // the raw bytes entry; the "response" entry above is the action
 	case e.Dir == "mock->harness":
 		a.handleAction(e)
 	case e.Dir == "note":
@@ -141,7 +147,7 @@ func (a *reportAgg) handleAction(e reportEntry) {
 		a.steps = append(a.steps, sequence.Step{Tool: act.ToolName, Input: act.ToolInput})
 	case "text", "end":
 		fmt.Printf("  #%-3d  %-9s %q\n", e.Seq, act.Kind, act.Text)
-		a.steps = append(a.steps, sequence.Step{Text: act.Text, End: act.Kind == "end"})
+		a.steps = append(a.steps, sequence.Step{Text: act.Text})
 	}
 }
 

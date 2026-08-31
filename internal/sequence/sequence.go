@@ -13,24 +13,22 @@ import (
 	"daiyaku/internal/neutral"
 )
 
-// Exactly one of Tool or Text is set.
+// Exactly one of Tool or Text is set. A "text" step always ends the harness's
+// turn: neither wire format has a way for the model to speak and keep going, so
+// there is no flag to control it. Older files carrying "end": true still load;
+// the field is simply ignored.
 type Step struct {
 	Note  string          `json:"note,omitempty"` // ignored on replay
 	Tool  string          `json:"tool,omitempty"`
 	Input json.RawMessage `json:"input,omitempty"`
 	Text  string          `json:"text,omitempty"`
-	End   bool            `json:"end,omitempty"`
 }
 
 func (s Step) Action() neutral.Action {
 	if s.Tool != "" {
 		return neutral.Action{Kind: neutral.ActionToolCall, ToolName: s.Tool, ToolInput: s.Input}
 	}
-	kind := neutral.ActionText
-	if s.End {
-		kind = neutral.ActionEnd
-	}
-	return neutral.Action{Kind: kind, Text: s.Text}
+	return neutral.Action{Kind: neutral.ActionEnd, Text: s.Text}
 }
 
 func FromAction(a neutral.Action, note string) Step {
@@ -39,9 +37,6 @@ func FromAction(a neutral.Action, note string) Step {
 	case neutral.ActionToolCall:
 		s.Tool = a.ToolName
 		s.Input = a.ToolInput
-	case neutral.ActionEnd:
-		s.Text = a.Text
-		s.End = true
 	default:
 		s.Text = a.Text
 	}
@@ -91,7 +86,7 @@ func Load(path string) (*File, error) {
 // far cheaper to catch when the file is loaded than three steps into a run.
 func (f *File) Validate() error {
 	for i, s := range f.Steps {
-		if s.Tool == "" && s.Text == "" && !s.End {
+		if s.Tool == "" && s.Text == "" {
 			return fmt.Errorf("step %d has neither \"tool\" nor \"text\" (note: %q)", i+1, s.Note)
 		}
 		if s.Tool != "" && s.Text != "" {

@@ -161,11 +161,11 @@ func parseServeFlags(prof profile, args []string) (*flags, error) {
 	fs.StringVar(&f.record, "record", "", "append authored actions to this sequence file")
 	fs.StringVar(&f.record, "r", "", "alias for -record")
 	fs.DurationVar(&f.delay, "delay", 400*time.Millisecond, "canned mode: delay between steps")
-	fs.BoolVar(&f.fallback, "fallback", true, "canned mode: hand the tail to interactive operator")
+	fs.BoolVar(&f.fallback, "fallback", true, "canned mode: hand the tail to the operator when the sequence runs out (false: end the turn and stop)")
 	fs.StringVar(&f.runsDir, "runs-dir", "runs", "base directory for per-session evidence")
 	fs.StringVar(&f.upstream, "upstream", "", "passthrough mode: real upstream base URL to proxy to (e.g. https://api.anthropic.com)")
 	fs.StringVar(&f.upstream, "u", "", "alias for -upstream")
-	fs.IntVar(&f.classGrade, "classifier-severity", 0, "auto-answer the harness safety classifier with this severity (0=allow); -1 disables and lets the operator handle it")
+	fs.IntVar(&f.classGrade, "classifier-severity", 0, "canned grade for the harness safety-classifier side-call, 0-100 (50 is its allow/block line, so 0 allows and 80 blocks); -1 leaves the calls to the operator")
 
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `usage: daiyaku [serve] [flags]
@@ -242,6 +242,12 @@ func runServe(prof profile, args []string) error {
 	if f.mode == "passthrough" {
 		if f.upstream == "" {
 			return fmt.Errorf("passthrough mode requires -upstream <base-url>")
+		}
+		// Nothing is authored in passthrough: the real model answers. Accepting
+		// -record here would silently produce no file at all.
+		if f.record != "" {
+			return fmt.Errorf("-record has no meaning in passthrough mode: no actions are authored there. " +
+				"The exchange is captured in the transcript; run 'daiyaku report <run-dir>' afterwards for a replayable sequence")
 		}
 		srv.SetProxy(server.NewProxy(f.upstream))
 		return runPassthrough(ctx, cancel, srv, f, sessionDir)

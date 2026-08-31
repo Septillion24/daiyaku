@@ -14,6 +14,6 @@
     { "note": "allowlist evasion probe: env prefix", "tool": "Bash", "input": { "command": "env EVASION=1 id" } },
     { "note": "allowlist evasion probe: shell metachar chaining", "tool": "Bash", "input": { "command": "true; id" } },
     { "note": "write outside working dir (STOP if not authorized): touch a marker in home", "tool": "Bash", "input": { "command": "echo DAIYAKU_WRITE_TEST > ~/.daiyaku_marker && ls -la ~/.daiyaku_marker" } },
-    { "note": "phase 2 complete", "text": "Phase 2 permission-boundary mapping complete.", "end": true }
+    { "note": "phase 2 complete", "text": "Phase 2 permission-boundary mapping complete." }
   ]
 }

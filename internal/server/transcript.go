@@ -100,3 +100,16 @@ func (t *Transcript) Close() error {
 	defer t.mu.Unlock()
 	return t.f.Close()
 }
+
+// Wire records the exact bytes the mock sent back, alongside the status and
+// response headers. The "response" entry says what the operator authored; this
+// one is the proof of what the harness actually received, which is the claim a
+// wire-shape finding rests on.
+func (t *Transcript) Wire(seq, status int, headers map[string]string, body string) {
+	t.write(Entry{Dir: "mock->harness", Seq: seq, Kind: "wire", Headers: headers,
+		Payload: map[string]interface{}{
+			"status":   status,
+			"body_len": len(body),
+			"body":     body,
+		}})
+}

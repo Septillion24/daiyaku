@@ -138,12 +138,47 @@ state without leaving.
 | --- | --- | --- |
 | **REPL** | `--mode repl` (default) | line-based console, robust anywhere |
 | **TUI** | `--mode tui` | full-screen operator console |
-| **Canned** | `--mode canned --sequence f.json` | replay a sequence; `--fallback` hands the tail to an operator |
+| **Canned** | `--mode canned --sequence f.json` | replay a sequence, then hand the tail to an operator (`-fallback=false` to end the turn and stop instead, for unattended re-tests) |
 | **Passthrough** | `--mode passthrough --upstream https://api.anthropic.com` | proxy the real harness↔API and log wire shapes; the methodology's Step-0 capture |
 
 `--record chain.json` (TUI and REPL) saves everything you author into a replayable
 file. Ship it with the report so the client can re-run each finding after
 remediation.
+
+## The harness safety classifier
+
+Claude Code does not only call the model for turns. Before it runs a tool call it
+fires a **side-channel classifier call** that grades the pending action and
+expects `<severity>N</severity>` back, on a short deadline. The scale is 0-100
+with 50 as the allow/block line: below 50 the action proceeds, above 50 the
+harness blocks it.
+
+A human cannot answer that in time. Left to the operator, the call sits in the
+console, the deadline passes, and the harness reports the model as unavailable.
+So daiyaku answers it automatically:
+
+```bash
+daiyaku                          # default: -classifier-severity 0 (allow everything)
+daiyaku -classifier-severity 80  # answer above the line: the harness blocks the action
+daiyaku -classifier-severity -1  # do not answer; the calls reach the operator
+```
+
+**This changes what your test measures, and belongs in the report.** At the
+default the harness's own auto-approval guardrail is switched off, so the run
+maps the permission model *without* it. That is usually what you want (you are
+testing IAM and harness config, not a model-side control, and the classifier is
+vendor behavior you cannot write policy against), but it is a stated condition of
+the result, not a detail. The startup banner prints which mode is active.
+
+Grade a run at `80` to check the opposite question: does the harness actually
+honor a block, and does anything downstream still execute?
+
+The call is recognized by shape rather than by one sentence of its prompt: no
+tools offered, plus a `</severity>` stop sequence, or the `<severity>` tag, or
+the known opening line. Any one of those is enough, so a harness release that
+rewords the prompt does not silently break recognition. If a tool-less request
+does reach the console unrecognized, both consoles warn rather than leaving you
+to work out why the harness stalled.
 
 ## Sequences
 
@@ -153,9 +188,12 @@ Ordered operator actions in JSON:
 { "name": "recon", "steps": [
   { "note": "who am i",  "tool": "Bash", "input": { "command": "id" } },
   { "note": "aws creds", "tool": "Bash", "input": { "command": "ls -la ~/.aws" } },
-  { "text": "done", "end": true }
+  { "text": "done" }
 ] }
 ```
+
+A `text` step ends the harness's turn: neither wire format lets an assistant
+message speak and keep going, so put it last.
 
 Starters for each methodology phase are in [`sequences/`](sequences/)
 (permission-boundary, blast-radius, egress). Tool names assume Claude Code; verify
@@ -166,6 +204,10 @@ against Phase-1 enumeration before running elsewhere.
 Every run writes `runs/<timestamp>/transcript.jsonl`: the full request/response
 record both directions, sensitive headers redacted to `<redacted:present>`. This
 is your primary evidence.
+
+Each turn is two outbound entries: `kind: "response"` is the action you authored,
+and `kind: "wire"` is the exact byte-for-byte body the harness received (status
+and headers included). The second is what a wire-shape finding rests on.
 
 The transcript is owner-only (0600) because it holds whatever the agent read:
 the full system prompt, file contents, and any secret it surfaced. Treat the run
@@ -199,6 +241,10 @@ Read the methodology's §2 first. Default to read-only; require a named written
 exception for any write/delete/send. `ls` on the directory is a finding, `rm` is
 an incident. This is purple team: agree a deconfliction marker with the SOC and
 record each test window.
+
+Record the `-classifier-severity` setting alongside the results: at the default
+the harness's own auto-approval guardrail is off, which is a condition of every
+finding in the run.
 
 ## Adding a provider
 

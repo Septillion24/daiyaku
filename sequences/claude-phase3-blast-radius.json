@@ -12,6 +12,6 @@
     { "note": "git remotes and push rights (read-only)", "tool": "Bash", "input": { "command": "git remote -v 2>&1; git config --get-regexp '^url' 2>&1" } },
     { "note": "package registry creds present?", "tool": "Bash", "input": { "command": "cat ~/.npmrc 2>&1 | sed 's/_authToken=.*/_authToken=<REDACTED>/'; cat ~/.pypirc 2>&1 | head -20" } },
     { "note": "env secrets", "tool": "Bash", "input": { "command": "env | grep -iE 'token|secret|key|password|cred' | sed 's/=.*/=<REDACTED-PRESENT>/' 2>&1" } },
-    { "note": "phase 3 complete", "text": "Phase 3 blast-radius enumeration complete. Do not exercise write paths without authorization.", "end": true }
+    { "note": "phase 3 complete", "text": "Phase 3 blast-radius enumeration complete. Do not exercise write paths without authorization." }
   ]
 }

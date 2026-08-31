@@ -154,7 +154,7 @@ func TestConcurrentSeqCorrelation(t *testing.T) {
 		switch {
 		case e.Dir == "harness->mock" && e.Kind == "request":
 			inbound[e.Seq]++
-		case e.Dir == "mock->harness":
+		case e.Dir == "mock->harness" && e.Kind == "response":
 			outbound[e.Seq]++
 		}
 	}
