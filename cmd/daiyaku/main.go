@@ -134,7 +134,7 @@ Env defaults:  DAIYAKU_PROVIDER, DAIYAKU_ADDR, DAIYAKU_MODE
                (set one to make it your default, then just run 'daiyaku')
 Precedence:    flag > env > profile > built-in default
 
-Run 'daiyaku -h' for all serve flags.
+Run 'daiyaku serve -h' for all serve flags.
 `)
 }
 

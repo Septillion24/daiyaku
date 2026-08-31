@@ -656,7 +656,11 @@ func (m model) toolsPane() string {
 	for _, n := range m.prevTools {
 		prev[n] = true
 	}
+	removed := m.removedTools()
 	listRows := m.bodyInner - 4
+	if len(removed) > 0 {
+		listRows-- // the "no longer offered" line is paid for out of the list
+	}
 	if listRows < 1 {
 		listRows = 1
 	}
@@ -679,8 +683,33 @@ func (m model) toolsPane() string {
 		b.WriteString(stMuted.Render(fmt.Sprintf("  %d above · %d below (j/k)",
 			first, len(m.tools)-last)) + "\n")
 	}
+	if len(removed) > 0 {
+		b.WriteString(lipgloss.NewStyle().Foreground(cWarn).Render(
+			truncate("- gone: "+strings.Join(removed, ", "), w-2)) + "\n")
+	}
 	b.WriteString(m.toolDetail(w))
 	return fitBorder(b.String(), w, m.bodyInner+1, m.focus == focusTools)
+}
+
+// removedTools returns the tools offered last turn but not this one. A tool
+// disappearing is as much a finding as one appearing, but it has no row of its
+// own to carry a marker, so the pane reports the set on one line instead.
+func (m model) removedTools() []string {
+	if len(m.prevTools) == 0 {
+		return nil
+	}
+	cur := make(map[string]bool, len(m.tools))
+	for _, t := range m.tools {
+		cur[t.Label()] = true
+	}
+	var out []string
+	for _, n := range m.prevTools {
+		if !cur[n] {
+			out = append(out, n)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // toolRow renders one row of the offered-tools list: a selection marker or a

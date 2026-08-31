@@ -215,3 +215,36 @@ func TestTUISmallTerminal(t *testing.T) {
 		}
 	}
 }
+
+// A tool that vanishes between turns is a finding, so the pane has to name it.
+// The '+' marker can only report arrivals; departures have no row to sit on.
+func TestTUIToolsPaneReportsRemovals(t *testing.T) {
+	tool := func(name string) neutral.ToolDef {
+		return neutral.ToolDef{Name: name, Kind: "function",
+			Schema: json.RawMessage(`{"type":"object","properties":{"command":{"type":"string"}}}`)}
+	}
+
+	var m tea.Model = newModel(&TUI{provider: "anthropic"})
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+
+	mm := m.(model)
+	mm.ex = &engine.Exchange{Req: &neutral.Request{Provider: "anthropic"}}
+	mm.tools = []neutral.ToolDef{tool("Bash"), tool("Read")}
+	mm.prevTools = []string{"Read", "WebFetch", "Write"}
+
+	pane := mm.toolsPane()
+	if !strings.Contains(pane, "gone:") {
+		t.Fatalf("no removal line in pane:\n%s", pane)
+	}
+	for _, want := range []string{"WebFetch", "Write"} {
+		if !strings.Contains(pane, want) {
+			t.Errorf("removed tool %q not named:\n%s", want, pane)
+		}
+	}
+
+	// A turn that removes nothing must not spend a row on an empty line.
+	mm.prevTools = []string{"Bash", "Read"}
+	if got := mm.toolsPane(); strings.Contains(got, "gone:") {
+		t.Errorf("removal line drawn with nothing removed:\n%s", got)
+	}
+}
