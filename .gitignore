@@ -1,0 +1,6 @@
+# Compiled binaries
+*.exe
+/dist/
+
+# Run output (transient transcripts)
+/runs/

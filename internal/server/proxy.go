@@ -1,0 +1,104 @@
+package server
+
+import (
+	"bytes"
+	"io"
+	"net/http"
+	"net/textproto"
+	"time"
+)
+
+// hopByHop headers are connection-scoped and must not be forwarded by a proxy (RFC 7230 §6.1).
+var hopByHop = map[string]bool{
+	"Connection": true, "Keep-Alive": true, "Proxy-Authenticate": true,
+	"Proxy-Authorization": true, "Te": true, "Trailer": true,
+	"Transfer-Encoding": true, "Upgrade": true,
+}
+
+type Proxy struct {
+	Upstream string
+	client   *http.Client
+}
+
+func NewProxy(upstream string) *Proxy {
+	return &Proxy{
+		Upstream: upstream,
+		client:   &http.Client{Timeout: 10 * time.Minute},
+	}
+}
+
+func (p *Proxy) Forward(w http.ResponseWriter, r *http.Request, body []byte, tx *Transcript, seq int) {
+	target := p.Upstream + r.URL.Path
+	if r.URL.RawQuery != "" {
+		target += "?" + r.URL.RawQuery
+	}
+	up, err := http.NewRequestWithContext(r.Context(), r.Method, target, bytes.NewReader(body))
+	if err != nil {
+		http.Error(w, "proxy build: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	// Dropping Accept-Encoding lets Go's transport request gzip and transparently
+	// decompress, so body_sample is readable text; the tradeoff is the recorded
+	// exchange is the decoded form, not the compressed wire.
+	for k, v := range r.Header {
+		ck := textproto.CanonicalMIMEHeaderKey(k)
+		if k == "Host" || k == "Content-Length" || ck == "Accept-Encoding" || hopByHop[ck] {
+			continue
+		}
+		up.Header[k] = v
+	}
+
+	resp, err := p.client.Do(up)
+	if err != nil {
+		tx.Note("proxy-error", map[string]string{"error": err.Error(), "target": target})
+		http.Error(w, "proxy: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Drop framing/hop-by-hop headers so they don't fight Go's own response
+	// framing as we re-stream the body.
+	for k, v := range resp.Header {
+		ck := textproto.CanonicalMIMEHeaderKey(k)
+		if ck == "Content-Length" || ck == "Transfer-Encoding" || hopByHop[ck] {
+			continue
+		}
+		w.Header()[k] = v
+	}
+	w.WriteHeader(resp.StatusCode)
+
+	var captured bytes.Buffer
+	flusher, _ := w.(http.Flusher)
+	buf := make([]byte, 4096)
+	for {
+		n, rerr := resp.Body.Read(buf)
+		if n > 0 {
+			w.Write(buf[:n])
+			captured.Write(buf[:n])
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			tx.Note("proxy-read-error", map[string]string{"error": rerr.Error()})
+			break
+		}
+	}
+	tx.Outbound(seq, map[string]interface{}{
+		"proxied":     true,
+		"status":      resp.StatusCode,
+		"upstream":    target,
+		"body_len":    captured.Len(),
+		"body_sample": firstN(captured.String(), 8000),
+	})
+}
+
+func firstN(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
+}

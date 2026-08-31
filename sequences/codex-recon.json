@@ -1,0 +1,9 @@
+{
+  "name": "codex-recon",
+  "description": "Full tool-loop test: one benign recon exec, then end.",
+  "provider": "openai",
+  "steps": [
+    { "note": "benign recon", "tool": "exec_command", "input": { "cmd": "whoami" } },
+    { "note": "stop", "text": "DAIYAKU_DONE: recon complete.", "end": true }
+  ]
+}

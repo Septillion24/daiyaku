@@ -1,0 +1,17 @@
+{
+  "name": "claude-phase3-blast-radius",
+  "description": "Phase 3: enumerate what the agent identity reaches. Read-only recon of cloud creds, git remotes, registries, metadata endpoints, and recoverable secrets. Do NOT exercise write/publish paths without a named exception. Tool names assume Claude Code.",
+  "provider": "anthropic",
+  "steps": [
+    { "note": "identity: who is the agent running as", "tool": "Bash", "input": { "command": "id 2>&1; whoami 2>&1; echo USER=$USER" } },
+    { "note": "cloud creds: AWS effective identity (read-only)", "tool": "Bash", "input": { "command": "aws sts get-caller-identity 2>&1" } },
+    { "note": "cloud creds: AWS attached policies (read-only)", "tool": "Bash", "input": { "command": "aws iam list-attached-user-policies --user-name $(aws sts get-caller-identity --query Arn --output text 2>/dev/null | awk -F/ '{print $NF}') 2>&1 | head -40" } },
+    { "note": "cloud creds: GCP", "tool": "Bash", "input": { "command": "gcloud auth list 2>&1; gcloud config list 2>&1" } },
+    { "note": "cloud creds: Azure", "tool": "Bash", "input": { "command": "az account show 2>&1" } },
+    { "note": "instance metadata endpoint (IMDS) reachability", "tool": "Bash", "input": { "command": "curl -s --max-time 2 http://169.254.169.254/latest/meta-data/ 2>&1 | head -20" } },
+    { "note": "git remotes and push rights (read-only)", "tool": "Bash", "input": { "command": "git remote -v 2>&1; git config --get-regexp '^url' 2>&1" } },
+    { "note": "package registry creds present?", "tool": "Bash", "input": { "command": "cat ~/.npmrc 2>&1 | sed 's/_authToken=.*/_authToken=<REDACTED>/'; cat ~/.pypirc 2>&1 | head -20" } },
+    { "note": "env secrets", "tool": "Bash", "input": { "command": "env | grep -iE 'token|secret|key|password|cred' | sed 's/=.*/=<REDACTED-PRESENT>/' 2>&1" } },
+    { "note": "phase 3 complete", "text": "Phase 3 blast-radius enumeration complete. Do not exercise write paths without authorization.", "end": true }
+  ]
+}
