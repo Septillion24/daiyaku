@@ -264,10 +264,10 @@ func runServe(prof profile, args []string) error {
 				"The exchange is captured in the transcript; run 'daiyaku report <run-dir>' afterwards for a replayable sequence")
 		}
 		srv.SetProxy(server.NewProxy(f.upstream))
-		return runPassthrough(ctx, cancel, srv, f, sessionDir)
+		return runPassthrough(ctx, cancel, srv, rt.tx, f, sessionDir)
 	}
 
-	return runConsoleLoop(ctx, cancel, srv, f, eng, sessionDir,
+	return runConsoleLoop(ctx, cancel, srv, rt.tx, f, eng, sessionDir,
 		func() { banner(f, sessionDir) }, nil)
 }
 
@@ -276,7 +276,7 @@ func runServe(prof profile, args []string) error {
 // caller wants once the server is up. cleanup always runs before returning,
 // including on a forced second signal, because intercept mode has machine
 // changes that must not outlive the process.
-func runConsoleLoop(ctx context.Context, cancel context.CancelFunc, srv *server.Server,
+func runConsoleLoop(ctx context.Context, cancel context.CancelFunc, srv *server.Server, tx *server.Transcript,
 	f *flags, eng *engine.Engine, sessionDir string, onReady, cleanup func()) error {
 
 	con, err := buildConsole(f, eng, sessionDir)
@@ -316,10 +316,22 @@ func runConsoleLoop(ctx context.Context, cancel context.CancelFunc, srv *server.
 	if err := waitForShutdown(ctx, cancel, srvErr, conErr); err != nil {
 		return err
 	}
-	time.Sleep(150 * time.Millisecond) // let the server drain before the process exits
 	runCleanup()
+	srv.Wait(3 * time.Second) // let in-flight handlers finish their evidence writes before exit
+	reportTranscriptHealth(tx)
 	fmt.Printf("\nlog saved to %s\n", absPath(sessionDir))
 	return nil
+}
+
+// reportTranscriptHealth repeats a transcript write failure at the end of the
+// run, where the operator is looking, rather than leaving it only at the moment
+// it happened somewhere up the scrollback.
+func reportTranscriptHealth(tx *server.Transcript) {
+	if n, err := tx.Failures(); n > 0 {
+		fmt.Fprintf(os.Stderr, "\n! %d transcript entr%s could not be saved (first error: %v).\n"+
+			"  The evidence for this run is INCOMPLETE; do not rely on it for a finding.\n",
+			n, map[bool]string{true: "y", false: "ies"}[n == 1], err)
+	}
 }
 
 // waitForShutdown blocks until the context is cancelled or the server or console
@@ -341,7 +353,7 @@ func waitForShutdown(ctx context.Context, cancel context.CancelFunc, srvErr, con
 	return nil
 }
 
-func runPassthrough(ctx context.Context, cancel context.CancelFunc, srv *server.Server, f *flags, sessionDir string) error {
+func runPassthrough(ctx context.Context, cancel context.CancelFunc, srv *server.Server, tx *server.Transcript, f *flags, sessionDir string) error {
 	sigc := make(chan os.Signal, 2)
 	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -360,6 +372,7 @@ func runPassthrough(ctx context.Context, cancel context.CancelFunc, srv *server.
 	fmt.Printf("  Ctrl+C to stop.\n\n")
 
 	err := srv.ListenAndServe(ctx)
+	reportTranscriptHealth(tx)
 	fmt.Printf("\nlog saved to %s\n", absPath(sessionDir))
 	return err
 }

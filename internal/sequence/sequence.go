@@ -15,8 +15,9 @@ import (
 
 // Exactly one of Tool or Text is set. A "text" step always ends the harness's
 // turn: neither wire format has a way for the model to speak and keep going, so
-// there is no flag to control it. Older files carrying "end": true still load;
-// the field is simply ignored.
+// there is no flag to control it. Older files carrying "end": true still load
+// when the step has text; the field is simply ignored, so an old step that was
+// only {"end": true} is rejected as empty.
 type Step struct {
 	Note  string          `json:"note,omitempty"` // ignored on replay
 	Tool  string          `json:"tool,omitempty"`

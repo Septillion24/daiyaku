@@ -86,3 +86,32 @@ func TestSubmitNilAuto(t *testing.T) {
 		t.Fatalf("action = %+v", got)
 	}
 }
+
+// A request whose harness gave up while it sat in the queue must not be shown to
+// the operator: composing a reply for it is wasted effort that can never land.
+func TestNextSkipsAbandonedRequests(t *testing.T) {
+	eng := New(2)
+	gone, cancelGone := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+	go func() {
+		eng.Submit(gone, &neutral.Request{Model: "abandoned"})
+		close(done)
+	}()
+	for len(eng.pending) < 1 { // wait until it is queued
+	}
+	cancelGone() // the harness times out
+	<-done
+
+	live := context.Background()
+	go eng.Submit(live, &neutral.Request{Model: "live"})
+
+	ex, err := eng.Next(live)
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+	if ex.Req.Model != "live" {
+		t.Fatalf("Next returned the %q request, want the live one", ex.Req.Model)
+	}
+	ex.Respond(neutral.Action{Kind: neutral.ActionEnd, Text: "ok"})
+}

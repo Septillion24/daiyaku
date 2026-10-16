@@ -182,11 +182,46 @@ state without leaving.
 | **REPL** | `-m repl` (default) | line-based console, robust anywhere |
 | **TUI** | `-m tui` | full-screen operator console |
 | **Canned** | `-m canned --sequence f.json` | replay a sequence, then hand the tail to an operator (`-fallback=false` to stop instead, for unattended re-tests) |
-| **Passthrough** | `-m passthrough --upstream https://api.anthropic.com` | proxy the real harness/API traffic and log wire shapes; the methodology's Step-0 capture |
+| **Passthrough** | `-m passthrough --upstream https://api.anthropic.com` | proxy the real harness/API traffic and log wire shapes; the methodology's Step-0 capture. Every path is forwarded upstream, not just the inference route |
 
 `--record chain.json` (TUI, REPL, and canned) saves everything you author into a
 replayable file. Ship it with the report so the client can re-run each finding
 after remediation.
+
+## The harness safety classifier
+
+Claude Code does not only call the model for turns. Before it runs a tool call it
+fires a **side-channel classifier call** that grades the pending action and
+expects `<severity>N</severity>` back, on a short deadline. The scale is 0-100
+with 50 as the allow/block line: below 50 the action proceeds, above 50 the
+harness blocks it.
+
+A human cannot answer that in time. Left to the operator, the call sits in the
+console, the deadline passes, and the harness reports the model as unavailable.
+So daiyaku answers it automatically:
+
+```bash
+daiyaku                          # default: -classifier-severity 0 (allow everything)
+daiyaku -classifier-severity 80  # answer above the line: the harness blocks the action
+daiyaku -classifier-severity -1  # do not answer; the calls reach the operator
+```
+
+**This changes what your test measures, and belongs in the report.** At the
+default the harness's own auto-approval guardrail is switched off, so the run
+maps the permission model *without* it. That is usually what you want (you are
+testing IAM and harness config, not a model-side control, and the classifier is
+vendor behavior you cannot write policy against), but it is a stated condition of
+the result, not a detail. The startup banner prints which mode is active.
+
+Grade a run at `80` to check the opposite question: does the harness actually
+honor a block, and does anything downstream still execute?
+
+The call is recognized by shape rather than by one sentence of its prompt: no
+tools offered, plus a `</severity>` stop sequence, or the `<severity>` tag, or
+the known opening line. Any one of those is enough, so a harness release that
+rewords the prompt does not silently break recognition. If a tool-less request
+does reach the console unrecognized, both consoles warn rather than leaving you
+to work out why the harness stalled.
 
 ## Sequences
 
@@ -200,7 +235,7 @@ Ordered operator actions in JSON:
 ] }
 ```
 
-A `text` step ends the harness's turn, so put it last. Starters for each
+A `text` step ends the harness's turn (an assistant message with no tool call is an end-of-turn on both wire formats), so put it last. Older files carrying `"end": true` still load as long as the step has text. Starters for each
 methodology phase are in [`sequences/`](sequences/) (permission-boundary,
 blast-radius, egress, plus a Codex recon starter). Tool names assume Claude Code;
 verify against Phase-1 enumeration before running elsewhere.
@@ -240,9 +275,9 @@ daiyaku report runs/20260830-150405
 prints the finding-chain summary and writes a `reconstructed-sequence.json` you
 can replay with `-m canned`.
 
-The transcript is owner-only (0600) because it holds whatever the agent read:
+The transcript is owner-only because it holds whatever the agent read (0700/0600 on Unix; Windows ignores mode bits, so daiyaku sets the run directory's ACL to the current user via `icacls` and warns if it cannot):
 system prompt, file contents, any secret it surfaced. Treat the run directory as
-client data. Collect alongside it (methodology §7): `claude --debug` logs, EDR
+client data. If an entry cannot be written (disk full), daiyaku says so at once and again when the run ends, and that run's evidence is incomplete. A refused action (malformed tool input) is not logged as a `response`, since the harness got a 400: the transcript holds an `invalid-action` note with the rejected action, plus a `wire` entry for the error. Collect alongside it (methodology §7): `claude --debug` logs, EDR
 process tree, SIEM for the window, proxy/DNS logs, and cloud/SaaS audit logs for
 the agent identity. Most of the detection surface is the child processes (`bash`,
 `git`, file writes, package installs), not the harness.
@@ -262,6 +297,10 @@ exception for any write, delete, or send. `ls` on the directory is a finding,
 `rm` is an incident. This is purple team: agree a deconfliction marker with the
 SOC and record each test window, and record the `-classifier-severity` setting
 alongside the results.
+
+Record the `-classifier-severity` setting alongside the results: at the default
+the harness's own auto-approval guardrail is off, which is a condition of every
+finding in the run.
 
 ## Adding a provider
 

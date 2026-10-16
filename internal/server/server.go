@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -30,8 +31,12 @@ type Server struct {
 	addr    string
 	proxy   *Proxy
 	seq     int64
+
+	stopped chan struct{} // closed once ListenAndServe has fully shut down
 }
 
+// SetProxy switches the server to passthrough: every request, whatever its path,
+// is forwarded upstream and nothing is answered by the mock. Call before serving.
 func (s *Server) SetProxy(p *Proxy) { s.proxy = p }
 
 // SetTLS makes ListenAndServe terminate TLS with cfg, which is how intercept
@@ -39,26 +44,64 @@ func (s *Server) SetProxy(p *Proxy) { s.proxy = p }
 func (s *Server) SetTLS(cfg *tls.Config) { s.tls = cfg }
 
 func New(a adapter.Adapter, e *engine.Engine, tx *Transcript, addr string) *Server {
-	s := &Server{adapter: a, engine: e, tx: tx, mux: http.NewServeMux(), addr: addr}
+	s := &Server{adapter: a, engine: e, tx: tx, mux: http.NewServeMux(), addr: addr,
+		stopped: make(chan struct{})}
 	routes := a.Routes()
 	s.mux.HandleFunc(routes.Primary, s.handlePrimary)
 	for pattern, h := range routes.Aux {
 		s.mux.HandleFunc(pattern, s.wrapAux(h))
 	}
-	s.http = &http.Server{Addr: addr, Handler: s.logRequests(s.mux)}
+	s.http = &http.Server{
+		Addr:    addr,
+		Handler: s.logRequests(http.HandlerFunc(s.dispatch)),
+		// Bounds how long a client may dawdle over its headers. No Read/Write
+		// timeout: a handler legitimately waits on the operator, and SSE responses
+		// are long-lived.
+		ReadHeaderTimeout: 10 * time.Second,
+	}
 	return s
+}
+
+// dispatch sends a request to the mock's routes, or in passthrough straight to
+// the upstream. The proxy has to see every path: a Step-0 capture that answered
+// count_tokens or /v1/models from the mock's stubs, or 404'd anything else, would
+// record a harness behaving differently from how it does against the real API.
+func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) {
+	if s.proxy != nil {
+		s.handleProxied(w, r)
+		return
+	}
+	s.mux.ServeHTTP(w, r)
 }
 
 func (s *Server) Addr() string { return s.addr }
 
 func (s *Server) Handler() http.Handler { return s.http.Handler }
 
+// Wait blocks until ListenAndServe has finished shutting down (in-flight handlers
+// drained, or the grace period spent), or until timeout. Callers use it so the
+// process does not exit, and the transcript does not close, under a handler that
+// is still writing evidence.
+func (s *Server) Wait(timeout time.Duration) {
+	select {
+	case <-s.stopped:
+	case <-time.After(timeout):
+	}
+}
+
 func (s *Server) ListenAndServe(ctx context.Context) error {
+	// Request contexts derive from ctx, so cancelling it releases handlers that are
+	// blocked waiting for the operator. Shutdown alone does not: it waits for them.
+	s.http.BaseContext = func(net.Listener) context.Context { return ctx }
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-ctx.Done()
 		shutCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		s.http.Shutdown(shutCtx)
+		if err := s.http.Shutdown(shutCtx); err != nil {
+			s.tx.Note("shutdown-error", map[string]string{"error": err.Error()})
+		}
 	}()
 	var err error
 	if s.tls != nil {
@@ -68,7 +111,13 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		err = s.http.ListenAndServe()
 	}
 	if err == http.ErrServerClosed {
-		return nil
+		<-shutdownDone // ErrServerClosed is returned as soon as Shutdown begins
+		err = nil
+	}
+	select {
+	case <-s.stopped:
+	default:
+		close(s.stopped)
 	}
 	return err
 }
@@ -118,6 +167,18 @@ func (s *Server) wrapAux(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// handleProxied forwards one request to the upstream and records the exchange.
+func (s *Server) handleProxied(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "read body", http.StatusBadRequest)
+		return
+	}
+	seq := int(atomic.AddInt64(&s.seq, 1))
+	s.tx.Inbound(seq, redactHeaders(r.Header), decodeForLog(body))
+	s.proxy.Forward(w, r, body, s.tx, seq)
+}
+
 func (s *Server) handlePrimary(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -125,12 +186,6 @@ func (s *Server) handlePrimary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	seq := int(atomic.AddInt64(&s.seq, 1))
-
-	if s.proxy != nil {
-		s.tx.Inbound(seq, redactHeaders(r.Header), decodeForLog(body))
-		s.proxy.Forward(w, r, body, s.tx, seq)
-		return
-	}
 
 	req, err := s.adapter.Normalize(r.Header, body)
 	if err != nil {
@@ -149,39 +204,72 @@ func (s *Server) handlePrimary(w http.ResponseWriter, r *http.Request) {
 		// Client gone or shutting down.
 		return
 	}
-	s.tx.Outbound(req.Seq, action)
+
+	rec := &wireRecorder{ResponseWriter: w, status: http.StatusOK}
 
 	// A malformed action (typo in the composer, hand-written sequence file) must
 	// not reach the wire: the blocking encoder would fail after the 200 header is
 	// already sent, and the streaming path would ship the fragment verbatim. Fail
-	// the request visibly instead, so the harness reports a real error.
+	// the request visibly instead, so the harness reports a real error. It is
+	// checked before the action is recorded as a "response": that entry is what
+	// `daiyaku report` counts as a tool call and replays, and a refused action was
+	// never sent. The rejected action is kept in the note as evidence of the attempt.
 	if err := action.Validate(); err != nil {
-		s.tx.Note("invalid-action", map[string]string{"error": err.Error(), "seq": fmt.Sprint(req.Seq)})
-		writeWireError(w, err.Error())
+		// The input is stored as a string: it is the thing that failed to parse as
+		// JSON, so embedding it as raw JSON would make the note itself unwritable.
+		s.tx.Note("invalid-action", map[string]interface{}{
+			"error": err.Error(), "seq": req.Seq,
+			"action": map[string]string{
+				"kind": string(action.Kind), "tool_name": action.ToolName,
+				"tool_input": string(action.ToolInput), "text": action.Text,
+			},
+		})
+		writeWireError(rec, err.Error())
+		s.tx.Wire(req.Seq, rec.status, headerSnapshot(rec.Header()), rec.buf.String())
 		return
 	}
 
-	rec := &wireRecorder{ResponseWriter: w, status: http.StatusOK}
+	s.tx.Outbound(req.Seq, action)
 	if err := s.adapter.WriteResponse(rec, req, action); err != nil {
 		s.tx.Note("write-error", map[string]string{"error": err.Error()})
+	}
+	if rec.err != nil {
+		s.tx.Note("client-write-failed", map[string]interface{}{
+			"seq": req.Seq, "error": rec.err.Error(), "bytes_received": rec.buf.Len(),
+		})
 	}
 	s.tx.Wire(req.Seq, rec.status, headerSnapshot(rec.Header()), rec.buf.String())
 }
 
-// sensitive headers are recorded as "<redacted:present>": evidence shows auth
-// was sent without capturing the secret.
-var sensitive = map[string]bool{
-	"authorization": true,
-	"x-api-key":     true,
-	"cookie":        true,
+// sensitiveFragments mark a header as carrying a credential. Matching on a
+// fragment of the name, not an exact list, catches the headers a fixed list
+// misses: proxy-authorization, x-goog-api-key, x-amz-security-token, set-cookie,
+// anthropic-auth-token, and whatever a harness adds next release.
+var sensitiveFragments = []string{
+	"authorization", "authentication", "auth-", "-auth", "api-key", "apikey",
+	"token", "cookie", "secret", "credential", "password", "signature",
 }
 
+func isSensitiveHeader(lowerName string) bool {
+	if lowerName == "auth" {
+		return true
+	}
+	for _, f := range sensitiveFragments {
+		if strings.Contains(lowerName, f) {
+			return true
+		}
+	}
+	return false
+}
+
+// Sensitive headers are recorded as "<redacted:present>": evidence shows auth
+// was sent without capturing the secret.
 func redactHeaders(h http.Header) map[string]string {
 	out := map[string]string{}
 	for k, v := range h {
 		lk := strings.ToLower(k)
 		val := strings.Join(v, ", ")
-		if sensitive[lk] {
+		if isSensitiveHeader(lk) {
 			val = "<redacted:present>"
 		}
 		out[lk] = val
@@ -220,6 +308,7 @@ type wireRecorder struct {
 	http.ResponseWriter
 	buf    bytes.Buffer
 	status int
+	err    error // first failed write: the harness stopped listening
 }
 
 func (wr *wireRecorder) WriteHeader(code int) {
@@ -227,9 +316,16 @@ func (wr *wireRecorder) WriteHeader(code int) {
 	wr.ResponseWriter.WriteHeader(code)
 }
 
+// Write records only the bytes the underlying writer accepted. A harness that
+// disconnects mid-stream makes the real write fail part way, and buffering the
+// whole of p first would claim the harness received bytes it never got.
 func (wr *wireRecorder) Write(p []byte) (int, error) {
-	wr.buf.Write(p)
-	return wr.ResponseWriter.Write(p)
+	n, err := wr.ResponseWriter.Write(p)
+	wr.buf.Write(p[:n])
+	if err != nil && wr.err == nil {
+		wr.err = err
+	}
+	return n, err
 }
 
 func (wr *wireRecorder) Flush() {

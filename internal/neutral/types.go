@@ -82,8 +82,9 @@ type Request struct {
 
 type ActionKind string
 
-// There is no "speak and continue" action: neither wire format lets an assistant
-// message keep the turn open, so any words the operator sends end it.
+// There is no "speak and continue" action. An assistant message with no tool call
+// ends the turn on both wire formats, and daiyaku does not author text alongside
+// a tool call, so any words the operator sends end it.
 const (
 	ActionToolCall ActionKind = "tool_call"
 	ActionEnd      ActionKind = "end" // assistant text with end_turn stop reason

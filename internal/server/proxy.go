@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/textproto"
+	"strings"
 	"time"
 )
 
@@ -25,7 +26,7 @@ type Proxy struct {
 // should be quick instead, and let the request context carry cancellation.
 func NewProxy(upstream string) *Proxy {
 	return &Proxy{
-		Upstream: upstream,
+		Upstream: strings.TrimRight(upstream, "/"), // so base + "/v1/..." never gains a double slash
 		client: &http.Client{
 			Transport: &http.Transport{
 				Proxy:                 http.ProxyFromEnvironment,

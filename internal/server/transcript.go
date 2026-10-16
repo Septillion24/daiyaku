@@ -16,6 +16,9 @@ type Transcript struct {
 	mu  sync.Mutex
 	f   *os.File
 	dir string
+
+	failures int   // entries that could not be persisted
+	firstErr error // the first such failure
 }
 
 type Entry struct {
@@ -55,10 +58,16 @@ func NewSessionDir(base string, start time.Time) (string, error) {
 
 // Evidence holds whatever the agent read during the run (file contents, secrets
 // it surfaced, the full system prompt), so the directory and the file are owner
-// only rather than world readable.
+// only rather than world readable. The mode bits do that on Unix; Windows ignores
+// them, so restrictToOwner sets the directory's ACL there.
 func NewTranscript(sessionDir string) (*Transcript, error) {
 	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
 		return nil, err
+	}
+	if err := restrictToOwner(sessionDir); err != nil {
+		fmt.Fprintf(os.Stderr, "! could not restrict %s to its owner: %v\n"+
+			"  the transcript may be readable by other local users; protect the directory yourself.\n",
+			sessionDir, err)
 	}
 	f, err := os.OpenFile(filepath.Join(sessionDir, "transcript.jsonl"),
 		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
@@ -74,13 +83,49 @@ func (t *Transcript) write(e Entry) {
 	e.TS = time.Now().UTC().Format(time.RFC3339Nano)
 	b, err := json.Marshal(e)
 	if err != nil {
-		return
+		// Leave a visible gap marker rather than a silent hole in the record. The
+		// replacement carries only strings and ints, so it cannot fail to marshal.
+		t.fail(fmt.Errorf("encode %s/%s entry: %w", e.Dir, e.Kind, err))
+		b, _ = json.Marshal(Entry{TS: e.TS, Dir: "note", Seq: e.Seq, Kind: "encode-error",
+			Payload: map[string]string{"error": err.Error(), "dropped_dir": e.Dir, "dropped_kind": e.Kind}})
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.f.Write(b)
-	t.f.Write([]byte("\n"))
-	t.f.Sync()
+	// One Write per entry so a failure cannot leave a line without its newline.
+	if _, err := t.f.Write(append(b, '\n')); err != nil {
+		t.failLocked(fmt.Errorf("write transcript: %w", err))
+		return
+	}
+	if err := t.f.Sync(); err != nil {
+		t.failLocked(fmt.Errorf("sync transcript: %w", err))
+	}
+}
+
+// fail records a failure to persist evidence. The first one is announced on
+// stderr at once, because the operator's only defence is the transcript and a
+// silently incomplete one is worse than a loud one; later ones are only counted
+// so a full disk does not flood the console.
+func (t *Transcript) fail(err error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.failLocked(err)
+}
+
+func (t *Transcript) failLocked(err error) {
+	t.failures++
+	if t.firstErr == nil {
+		t.firstErr = err
+		fmt.Fprintf(os.Stderr, "\n! TRANSCRIPT WRITE FAILED: %v\n  evidence for this run is incomplete (%s)\n",
+			err, filepath.Join(t.dir, "transcript.jsonl"))
+	}
+}
+
+// Failures reports how many entries could not be persisted and the first error,
+// so the caller can say so again when the run ends.
+func (t *Transcript) Failures() (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.failures, t.firstErr
 }
 
 func (t *Transcript) Inbound(seq int, headers, payload interface{}) {

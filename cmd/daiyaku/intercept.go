@@ -176,7 +176,7 @@ func interceptServe(f *flags, in *intercept.Interceptor, hosts []string, dir str
 		interceptBanner(f, in, report, hosts, rt.sessionDir, trustStore)
 	}
 
-	err = runConsoleLoop(ctx, cancel, rt.srv, f, rt.eng, rt.sessionDir, ready, cleanup)
+	err = runConsoleLoop(ctx, cancel, rt.srv, rt.tx, f, rt.eng, rt.sessionDir, ready, cleanup)
 	if selfTestErr != nil {
 		// Exit non-zero so a script driving this can tell the difference between a
 		// finished run and one that never intercepted anything.

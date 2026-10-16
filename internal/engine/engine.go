@@ -99,11 +99,21 @@ func (e *Engine) Submit(ctx context.Context, req *neutral.Request) (neutral.Acti
 	}
 }
 
+// Next returns the next request for the operator to answer. A request whose
+// harness already gave up (a timeout, then a retry) is skipped: it would only
+// have the operator compose a reply that can never be delivered, one per retry.
 func (e *Engine) Next(ctx context.Context) (*Exchange, error) {
-	select {
-	case ex := <-e.pending:
-		return ex, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	for {
+		select {
+		case ex := <-e.pending:
+			select {
+			case <-ex.gone:
+				continue
+			default:
+			}
+			return ex, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 }
